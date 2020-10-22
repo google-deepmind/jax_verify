@@ -144,7 +144,7 @@ def solve_lp_primal_elided(verif_instance):
   return obj_cp.value + obj_const, info
 
 
-def solve_sdp_mlp_elided(verif_instance, solver_name='SCS', verbose=False,
+def solve_sdp_mlp_elided(verif_instance, solver_name='SCS', verbose=True,
                          check_feasibility=False, feasibility_margin=0.0):
   """Compute exact SDP relaxation verified bound, following Raghunathan 18.
 

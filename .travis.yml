@@ -12,6 +12,11 @@ python:
   - "3.6"
   - "3.7"
   - "3.8"
+addons:
+  apt:
+    packages:
+      - libblas-dev
+      - liblapack-dev
 install:
   - pip install .
 script:

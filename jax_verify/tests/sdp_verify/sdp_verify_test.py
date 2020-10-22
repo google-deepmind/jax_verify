@@ -220,7 +220,7 @@ class SdpVerifyTestCNNvsMLP(parameterized.TestCase):
           num_steps=num_steps, verbose=False, use_exact_eig_train=True)
       dual_ub_mlp, _ = sdp_verify.solve_sdp_dual(
           utils.make_sdp_verif_instance(verif_instance_mlp), key,
-          num_steps=num_steps, verbose=False, use_exact_eig_train=True)
+          num_steps=num_steps, verbose=True, use_exact_eig_train=False)
       assert abs(dual_ub_cnn - dual_ub_mlp) < 1e-2, (
           'Dual upper bound for MLP and CNN (simple CNN) should match.'
           f'Seed is {seed}. Vals are CNN: {dual_ub_cnn} MLP: {dual_ub_mlp}')

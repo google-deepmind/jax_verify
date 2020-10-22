@@ -1,2 +1,10 @@
 sphinx>=2.0.1
 sphinx_rtd_theme>=0.4.3
+absl-py
+cvxpy
+dm-tree
+jax>=0.1.71
+jaxlib>=0.1.49
+numpy
+optax
+dm-haiku

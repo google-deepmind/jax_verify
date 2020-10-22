@@ -1,0 +1,21 @@
+# For context, jax_verify is developed day-to-day using internal continuous
+# integration software.
+#
+# The current Travis CI setup is unpolished and verifies that open-source
+# jax_verify builds correctly. This is done on a best-effort basis; we are not
+# attached to Travis CI.
+#
+# If you use jax_verify, continuous integration improvements are welcome.
+
+language: python
+python:
+  - "3.6"
+  - "3.7"
+  - "3.8"
+install:
+  - pip install .
+script:
+  - pwd
+  - python3 --version
+  - cd jax_verify/tests
+  - pytest

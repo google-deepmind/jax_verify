@@ -1,0 +1,8 @@
+absl-py
+cvxpy
+dm-tree
+jax>=0.1.71
+jaxlib>=0.1.49
+numpy
+optax
+dm-haiku

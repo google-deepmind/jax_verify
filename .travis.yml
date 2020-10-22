@@ -17,6 +17,8 @@ addons:
     packages:
       - libblas-dev
       - liblapack-dev
+env:
+  - TRAVIS=true
 install:
   - pip install .
 script:

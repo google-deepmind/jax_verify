@@ -1,5 +1,5 @@
 ##################
-Tree Documentation
+jax_verify Documentation
 ##################
 
 .. toctree::

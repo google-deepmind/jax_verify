@@ -12,6 +12,13 @@ python:
   - "3.6"
   - "3.7"
   - "3.8"
+addons:
+  apt:
+    packages:
+      - libblas-dev
+      - liblapack-dev
+env:
+  - TRAVIS=true
 install:
   - pip install .
 script:

@@ -16,7 +16,6 @@
 """Provides methods to simplify the JaxPR computation graph.
 """
 import jax
-import jax.numpy as jnp
 
 
 def activation_detector(graph):
@@ -90,5 +89,25 @@ def _is_softplus(graph, eqn_idx):
   return True
 
 
-softplus_p = jax.lax.standard_naryop([{jnp.floating}], 'Softplus')
-softplus_p.def_impl(jax.nn.softplus)
+class FakePrimitive:
+  """This wraps an implementation of a primitive we want to identify.
+
+  This way our code that assumes that it can go through the primitive by calling
+  `bind` will work transparently.
+  We don't want to define it properly as a primitive because otherwise
+  operations like the jit will assume that it's a real primitive and not have
+  definitions for it.
+  """
+
+  def __init__(self, name, impl):
+    self._name = name
+    self._impl = impl
+
+  def bind(self, *args, **kwargs):
+    return self._impl(*args, **kwargs)
+
+  @property
+  def name(self):
+    return self._name
+
+softplus_p = FakePrimitive('Softplus', jax.nn.softplus)

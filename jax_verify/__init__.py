@@ -27,5 +27,7 @@ from jax_verify.src.ibp import bound_transform as ibp_transform
 from jax_verify.src.ibp import interval_bound_propagation
 from jax_verify.src.ibp import IntervalBound
 from jax_verify.src.intersection import IntersectionBoundTransform
+from jax_verify.src.nonconvex_duals import nonconvex_ibp_bound_propagation
+from jax_verify.src.nonconvex_optimizers import nonconvex_constopt_bound_propagation
 from jax_verify.src.solve_relaxation import solve_planet_relaxation
 from jax_verify.src.utils import open_file

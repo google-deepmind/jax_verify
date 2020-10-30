@@ -129,6 +129,32 @@ class ModelZooModelTests(parameterized.TestCase):
 
   @parameterized.named_parameters(
       ('SmallResidualModel', model_zoo.SmallResidualModel),
+      ('ResidualModel', model_zoo.ResidualModel),
+      ('TinyModel', model_zoo.TinyModel))
+  def test_nonconvex(self, model_cls):
+
+    @hk.transform_with_state
+    def model_pred(inputs, is_training, test_local_stats=False):
+      model = model_cls()
+      return model(inputs, is_training, test_local_stats)
+
+    inps = jnp.zeros((4, 28, 28, 1), dtype=jnp.float32)
+    params, state = model_pred.init(jax.random.PRNGKey(42), inps,
+                                    is_training=True)
+
+    def logits_fun(inputs):
+      return model_pred.apply(params, state, None, inputs,
+                              False, test_local_stats=False)[0]
+
+    input_bounds = jax_verify.IntervalBound(inps - 1.0, inps + 1.0)
+    # Test with IBP for intermediate bounds
+    jax_verify.nonconvex_ibp_bound_propagation(logits_fun, input_bounds)
+
+    # Test with nonconvex bound evaluation for intermediate bounds
+    jax_verify.nonconvex_constopt_bound_propagation(logits_fun, input_bounds)
+
+  @parameterized.named_parameters(
+      ('SmallResidualModel', model_zoo.SmallResidualModel),
       ('TinyModel', model_zoo.TinyModel))
   def test_cvxpy_relaxation(self, model_cls):
 

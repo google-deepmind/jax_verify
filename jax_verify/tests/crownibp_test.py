@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ class CrownIBPBoundTest(parameterized.TestCase):
 
   def assertArrayAlmostEqual(self, lhs, rhs):
     diff = jnp.abs(lhs - rhs).max()
-    self.assertAlmostEqual(diff, 0.)
+    self.assertAlmostEqual(diff, 0., delta=1e-5)
 
   def test_fc_crownibp(self):
 

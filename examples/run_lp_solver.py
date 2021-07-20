@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ from absl import flags
 from absl import logging
 import jax.numpy as jnp
 import jax_verify
+from jax_verify.src.linear import forward_linear_bounds
 from jax_verify.src.sdp_verify import utils
 import numpy as np
 
@@ -84,9 +85,10 @@ def main(unused_args):
   upper_bound = jnp.minimum(jnp.maximum(inputs[:2, ...] + eps, 0.0), 1.0)
   init_bound = jax_verify.IntervalBound(lower_bound, upper_bound)
 
-  if FLAGS.boundprop_method == 'fastlin':
-    final_bound = jax_verify.fastlin_bound_propagation(logits_fn, init_bound)
-    boundprop_transform = jax_verify.fastlin_transform
+  if FLAGS.boundprop_method == 'forwardfastlin':
+    final_bound = jax_verify.forward_fastlin_bound_propagation(logits_fn,
+                                                               init_bound)
+    boundprop_transform = forward_linear_bounds.forward_fastlin_transform
   elif FLAGS.boundprop_method == 'ibp':
     final_bound = jax_verify.interval_bound_propagation(logits_fn, init_bound)
     boundprop_transform = jax_verify.ibp_transform
@@ -101,11 +103,11 @@ def main(unused_args):
                         jnp.ones_like(dummy_output[0, ...]),
                         jnp.zeros_like(dummy_output[0, ...]))
   objective_bias = 0.
-  value, status = jax_verify.solve_planet_relaxation(
+  value, _, status = jax_verify.solve_planet_relaxation(
       logits_fn, init_bound, boundprop_transform, objective,
       objective_bias, index=0)
   logging.info('Relaxation LB is : %f, Status is %s', value, status)
-  value, status = jax_verify.solve_planet_relaxation(
+  value, _, status = jax_verify.solve_planet_relaxation(
       logits_fn, init_bound, boundprop_transform, -objective,
       objective_bias, index=0)
   logging.info('Relaxation UB is : %f, Status is %s', -value, status)

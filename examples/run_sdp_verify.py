@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,7 +47,8 @@ import jax
 import jax.numpy as jnp
 import jax_verify
 from jax_verify import sdp_verify
-from jax_verify.src.sdp_verify import crown_boundprop
+from jax_verify.src.sdp_verify import boundprop_utils
+from jax_verify.src.sdp_verify import problem
 from jax_verify.src.sdp_verify import utils
 import numpy as np
 
@@ -59,8 +60,9 @@ flags.DEFINE_string('model_name', 'models/cifar10_wongsmall_eps2_mix.pkl',
                     'model name specifying Pickle file with network weights')
 flags.DEFINE_boolean('inception_preprocess', False,
                      'Use inception_preprocessing i.e. [-1,1]-scaled inputs')
-flags.DEFINE_boolean('use_crown', True,
-                     'Use CROWN to compute activation bounds.')
+flags.DEFINE_string('boundprop_type', 'crown_ibp',
+                    'Method for obtaining initial activation bounds. '
+                    'E.g. "crown_ibp" "nonconvex" or "ibp"')
 flags.DEFINE_float('lam_coeff', 1.0, 'Coeff for dual variables')
 flags.DEFINE_float('nu_coeff', 0.03, 'Coeff for dual variables')
 flags.DEFINE_float('custom_kappa_coeff', -1,
@@ -103,12 +105,13 @@ def _load_weights(path):
 def get_verif_instance(params, x, label, target_label, epsilon,
                        input_bounds=(0., 1.)):
   """Creates verif instance."""
-  if FLAGS.use_crown:
-    bounds = crown_boundprop.boundprop(
-        params, np.expand_dims(x, axis=0), epsilon, input_bounds=input_bounds)
-  else:
+  if FLAGS.boundprop_type == 'ibp':
     bounds = utils.boundprop(
         params, utils.init_bound(x, epsilon, input_bounds=input_bounds))
+  else:
+    bounds = boundprop_utils.boundprop(
+        params, np.expand_dims(x, axis=0), epsilon, input_bounds,
+        FLAGS.boundprop_type)
   verif_instance = utils.make_relu_robust_verif_instance(
       params, bounds, target_label=target_label, label=label,
       input_bounds=input_bounds)
@@ -131,7 +134,7 @@ def _opt_multiplier_fn(path, kappa_index, kappa_dim=None):
 
 def verify_cnn_single_dual(verif_instance):
   """Run verification for a CNN on a single MNIST/CIFAR problem."""
-  verif_instance = utils.make_sdp_verif_instance(verif_instance)
+  verif_instance = problem.make_sdp_verif_instance(verif_instance)
   solver_params = dict(
       use_exact_eig_train=FLAGS.use_exact_eig_train,
       use_exact_eig_eval=FLAGS.use_exact_eig_eval,

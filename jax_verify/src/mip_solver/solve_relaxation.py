@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ files, and provides a higher-level interface than using relaxation.py directly.
 """
 
 from jax_verify.src import bound_propagation
-from jax_verify.src import cvxpy_relaxation_solver
-from jax_verify.src import relaxation
+from jax_verify.src.mip_solver import cvxpy_relaxation_solver
+from jax_verify.src.mip_solver import relaxation
 
 
 def solve_planet_relaxation(
@@ -53,12 +53,14 @@ def solve_planet_relaxation(
       the resulting LP.
   Returns:
     val: The optimal value from the relaxation
+    solution: The optimal solution found by the solver
     status: The status of the relaxation solver
   """
   relaxation_transform = relaxation.RelaxationTransform(boundprop_transform)
-  variable, graph = bound_propagation.bound_propagation(
-      relaxation_transform, logits_fn, initial_bounds)
-  value, status = relaxation.solve_relaxation(
-      solver, objective, objective_bias, variable, graph.env,
-      index=index, time_limit=None)
-  return value, status
+  variable, env = bound_propagation.bound_propagation(
+      bound_propagation.ForwardPropagationAlgorithm(relaxation_transform),
+      logits_fn, initial_bounds)
+  value, solution, status = relaxation.solve_relaxation(
+      solver, objective, objective_bias, variable, env,
+      index=index, time_limit_millis=None)
+  return value, solution, status

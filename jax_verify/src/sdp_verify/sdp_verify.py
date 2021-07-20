@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -62,7 +62,7 @@ def dual_fun(verif_instance, dual_vars, key=None, n_iter=30, scl=-1,
   assert isinstance(verif_instance, utils.SdpDualVerifInstance)
   bounds = verif_instance.bounds
   layer_sizes = utils.layer_sizes_from_bounds(bounds)
-  layer_sizes_1d = [np.prod(np.array(i)) for i in layer_sizes]
+  layer_sizes_1d = [np.prod(np.array(i), dtype=np.int32) for i in layer_sizes]
   N = sum(layer_sizes_1d) + 1
   info = {}
 
@@ -280,7 +280,7 @@ def solve_sdp_dual(verif_instance, key=None, opt=None, num_steps=10000,
                    opt_multiplier_fn=None, init_dual_vars=None,
                    init_opt_state=None, opt_dual_vars=None,
                    kappa_reg_weight=None, kappa_zero_after=None,
-                   device_type=None, save_best_k=1):
+                   device_type=None, save_best_k=1, include_opt_state=False):
   # pylint: disable=g-doc-return-or-yield, g-doc-args
   """Compute verified lower bound via dual of SDP relaxation.
 
@@ -438,15 +438,15 @@ def solve_sdp_dual(verif_instance, key=None, opt=None, num_steps=10000,
   info['final_loss'] = final_loss
   info['loss_log'] = loss_log
   info['store_best'] = store_best
-
-  return final_loss, info
+  if include_opt_state:
+    return final_loss, info, opt_state
+  else:
+    return final_loss, info
 
 solve_dual_sdp_elided = solve_sdp_dual  # Alias
 
 ############     Dual initialization     ############
 
-DualVar = utils.DualVar
-DualVarFin = utils.DualVarFin
 DualVarTypes = utils.DualVarTypes
 
 
@@ -454,9 +454,8 @@ def init_duals(verif_instance, key):
   """Initialize dual variables to zeros."""
   del key  # unused
   assert isinstance(verif_instance, utils.SdpDualVerifInstance)
-  dual_shapes, _ = utils.get_dual_shapes_and_types(verif_instance.bounds)
   zeros_or_none = lambda s: None if s is None else jnp.zeros(s)
-  return jax.tree_map(zeros_or_none, dual_shapes)
+  return jax.tree_map(zeros_or_none, verif_instance.dual_shapes)
 
 
 def _get_g_lambda(verif_instance, dual_vars):

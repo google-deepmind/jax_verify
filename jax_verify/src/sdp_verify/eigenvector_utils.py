@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,9 +33,10 @@ def safe_eigh(a, UPLO=None, symmetrize_input=True):
   # TODO: Remove when issue with CUDA eigh is resolved
   eigs, eig_vecs = lax.cond(
       jnp.linalg.norm(a) > 0.0,
-      a, lambda a: jax.scipy.linalg.eigh(a, UPLO, symmetrize_input), a,
-      lambda tridiag: (jnp.zeros(a.shape[0]), jnp.eye(a.shape[0])))
-  return eigs, eig_vecs
+      lambda t: jax.scipy.linalg.eigh(t, UPLO, symmetrize_input),
+      lambda _: (jnp.zeros(a.shape[0]), jnp.eye(a.shape[0])),
+      operand=a)
+  return jax.lax.stop_gradient(eigs), jax.lax.stop_gradient(eig_vecs)
 
 
 def lanczos_alg(matrix_vector_product,

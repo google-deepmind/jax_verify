@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,16 +34,19 @@ MLP_PATH = 'models/raghunathan18_pgdnn.pkl'
 CNN_PATH = 'models/mnist_wongsmall_eps_10_adv.pkl'
 ALL_BOUNDPROP_METHODS = (
     jax_verify.interval_bound_propagation,
-    jax_verify.fastlin_bound_propagation,
-    jax_verify.ibpfastlin_bound_propagation,
-    jax_verify.crown_bound_propagation,
+    jax_verify.forward_fastlin_bound_propagation,
+    jax_verify.backward_fastlin_bound_propagation,
+    jax_verify.ibpforwardfastlin_bound_propagation,
+    jax_verify.forward_crown_bound_propagation,
+    jax_verify.backward_crown_bound_propagation,
     jax_verify.crownibp_bound_propagation,
 )
 
 flags.DEFINE_string('model', 'mlp', 'mlp or cnn')
 flags.DEFINE_string('boundprop_method', '',
                     'Any boundprop method, such as `interval_bound_propagation`'
-                    ' `fastlin_bound_propagation` `crown_bound_propagation`.'
+                    ' `forward_fastlin_bound_propagation` or '
+                    ' `crown_bound_propagation`.'
                     'Empty string defaults to IBP.')
 FLAGS = flags.FLAGS
 

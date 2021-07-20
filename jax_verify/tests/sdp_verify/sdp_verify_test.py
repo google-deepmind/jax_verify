@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import jax.scipy
 from jax_verify.src.sdp_verify import cvxpy_verify
 from jax_verify.src.sdp_verify import eigenvector_utils
+from jax_verify.src.sdp_verify import problem
 from jax_verify.src.sdp_verify import sdp_verify
 from jax_verify.src.sdp_verify import utils
 from jax_verify.tests.sdp_verify import test_utils
@@ -97,7 +98,7 @@ class SdpDualPrimalTest(parameterized.TestCase):
     key = jax.random.PRNGKey(0)
     primal_opt, _ = cvxpy_verify.solve_mip_mlp_elided(verif_instance)
     dual_ub, _ = sdp_verify.solve_sdp_dual(
-        utils.make_sdp_verif_instance(verif_instance), key, num_steps=1000)
+        problem.make_sdp_verif_instance(verif_instance), key, num_steps=1000)
     assert dual_ub > primal_opt - loss_margin, (
         'Dual upper bound should be greater than optimal primal objective.'
         f'Seed is {seed}. Vals are Dual: {dual_ub} Primal: {primal_opt}')
@@ -108,8 +109,8 @@ class SdpDualPrimalTest(parameterized.TestCase):
     key = jax.random.PRNGKey(0)
     primal_opt, _ = cvxpy_verify.solve_sdp_mlp_elided(verif_instance)
     dual_ub, _ = sdp_verify.solve_sdp_dual(
-        utils.make_sdp_verif_instance(verif_instance), key, num_steps=num_steps,
-        verbose=False)
+        problem.make_sdp_verif_instance(verif_instance), key,
+        num_steps=num_steps, verbose=False)
     assert dual_ub - primal_opt < loss_margin, (
         'Primal and dual vals should be close. '
         f'Seed: {seed}. Primal: {primal_opt}, Dual: {dual_ub}')
@@ -147,7 +148,7 @@ class SdpVerifyTest(parameterized.TestCase):
         'kappa_zero_after': 8,
         'device_type': None,
     }
-    verif_instance = utils.make_sdp_verif_instance(verif_instance)
+    verif_instance = problem.make_sdp_verif_instance(verif_instance)
     # Check all kwargs work.
     dual_val, _ = sdp_verify.solve_sdp_dual_simple(verif_instance, **kwargs)
     assert isinstance(dual_val, float)
@@ -161,7 +162,7 @@ class SdpVerifyTest(parameterized.TestCase):
           seed=0, target_label=1, label=2, nn=nn)
       key = jax.random.PRNGKey(0)
       dual_val, _ = sdp_verify.solve_sdp_dual(
-          utils.make_sdp_verif_instance(verif_instance), key, num_steps=10,
+          problem.make_sdp_verif_instance(verif_instance), key, num_steps=10,
           n_iter_lanczos=5)
     assert isinstance(dual_val, float)
 
@@ -171,10 +172,10 @@ class SdpVerifyTest(parameterized.TestCase):
           seed=0, target_label=1, label=2, nn=nn)
       key = jax.random.PRNGKey(0)
       dual_vars = sdp_verify.init_duals(
-          utils.make_sdp_verif_instance(verif_instance), key)
+          problem.make_sdp_verif_instance(verif_instance), key)
       assert len(dual_vars) == 3, 'Input, one hidden layer, kappa'
-      assert isinstance(dual_vars[0], sdp_verify.DualVar)
-      assert isinstance(dual_vars[1], sdp_verify.DualVarFin)
+      assert isinstance(dual_vars[0], problem.DualVar)
+      assert isinstance(dual_vars[1], problem.DualVarFin)
       assert isinstance(dual_vars[2], jax.interpreters.xla.DeviceArray)
 
   def test_ibp_init_matches_ibp_bound(self):
@@ -182,7 +183,7 @@ class SdpVerifyTest(parameterized.TestCase):
       for seed in range(20):
         orig_verif_instance = test_utils.make_toy_verif_instance(seed, nn=nn)
         key = jax.random.PRNGKey(0)
-        verif_instance = utils.make_sdp_verif_instance(orig_verif_instance)
+        verif_instance = problem.make_sdp_verif_instance(orig_verif_instance)
         dual_vars = jax.tree_map(lambda s: None if s is None else jnp.zeros(s),
                                  verif_instance.dual_shapes)
         dual_vars = sdp_verify.init_duals_ibp(verif_instance, dual_vars)
@@ -219,10 +220,10 @@ class SdpVerifyTestCNNvsMLP(parameterized.TestCase):
               ub_pre=None))
       verif_instance_mlp = utils.make_nn_verif_instance(params_mlp, bounds_mlp)
       dual_ub_cnn, _ = sdp_verify.solve_sdp_dual(
-          utils.make_sdp_verif_instance(verif_instance), key,
+          problem.make_sdp_verif_instance(verif_instance), key,
           num_steps=num_steps, verbose=False, use_exact_eig_train=True)
       dual_ub_mlp, _ = sdp_verify.solve_sdp_dual(
-          utils.make_sdp_verif_instance(verif_instance_mlp), key,
+          problem.make_sdp_verif_instance(verif_instance_mlp), key,
           num_steps=num_steps, verbose=False, use_exact_eig_train=True)
       assert abs(dual_ub_cnn - dual_ub_mlp) < 1e-2, (
           'Dual upper bound for MLP and CNN (simple CNN) should match.'
@@ -242,13 +243,13 @@ class SdpVerifyTestCNNvsMLP(parameterized.TestCase):
           sdp_verify.IntBound(lb=lb, ub=ub, lb_pre=None, ub_pre=None))
       verif_instance_mlp = utils.make_nn_verif_instance(params_mlp, bounds_mlp)
       dual_ub_cnn, _ = sdp_verify.solve_sdp_dual(
-          utils.make_sdp_verif_instance(verif_instance),
+          problem.make_sdp_verif_instance(verif_instance),
           key,
           num_steps=num_steps,
           verbose=False,
           use_exact_eig_train=True)
       dual_ub_mlp, _ = sdp_verify.solve_sdp_dual(
-          utils.make_sdp_verif_instance(verif_instance_mlp),
+          problem.make_sdp_verif_instance(verif_instance_mlp),
           key,
           num_steps=num_steps,
           verbose=False,

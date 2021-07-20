@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@ import jax
 import jax.numpy as jnp
 import jax_verify
 from jax_verify.src import bound_propagation
-from jax_verify.src import cvxpy_relaxation_solver
-from jax_verify.src import relaxation
+from jax_verify.src.mip_solver import cvxpy_relaxation_solver
+from jax_verify.src.mip_solver import relaxation
 
 
 class CVXPYRelaxationTest(parameterized.TestCase):
@@ -40,8 +40,9 @@ class CVXPYRelaxationTest(parameterized.TestCase):
 
     boundprop_transform = jax_verify.ibp_transform
     relaxation_transform = relaxation.RelaxationTransform(boundprop_transform)
-    var, graph = bound_propagation.bound_propagation(
-        relaxation_transform, fun, input_bounds)
+    var, env = bound_propagation.bound_propagation(
+        bound_propagation.ForwardPropagationAlgorithm(relaxation_transform),
+        fun, input_bounds)
 
     objective_bias = 0.
     index = 0
@@ -51,13 +52,13 @@ class CVXPYRelaxationTest(parameterized.TestCase):
     for output_idx in range(output.size):
       objective = (jnp.arange(output.size) == output_idx).astype(jnp.float32)
 
-      lower_bound, _ = relaxation.solve_relaxation(
+      lower_bound, _, _ = relaxation.solve_relaxation(
           cvxpy_relaxation_solver.CvxpySolver, objective, objective_bias,
-          var, graph.env, index)
+          var, env, index)
 
-      neg_upper_bound, _ = relaxation.solve_relaxation(
+      neg_upper_bound, _, _ = relaxation.solve_relaxation(
           cvxpy_relaxation_solver.CvxpySolver, -objective, objective_bias,
-          var, graph.env, index)
+          var, env, index)
       lower_bounds.append(lower_bound)
       upper_bounds.append(-neg_upper_bound)
 
@@ -101,8 +102,8 @@ class CVXPYRelaxationTest(parameterized.TestCase):
 
     lower_bounds, upper_bounds = self.get_bounds(fun, input_bounds)
 
-    self.assertAlmostEqual(7., lower_bounds)
-    self.assertAlmostEqual(11., upper_bounds)
+    self.assertAlmostEqual(7., lower_bounds, delta=1e-5)
+    self.assertAlmostEqual(11., upper_bounds, delta=1e-5)
 
   def test_conv2d_cvxpy_relaxation(self):
     def conv2d_model(inp):

@@ -33,10 +33,11 @@ The methods currently provided by `jax_verify` include:
 * SDP-FO (first-order SDP verification, [Dathathri et al 2020](https://arxiv.org/abs/2010.11645))
 * Non-convex ([Bunel et al 2020](https://arxiv.org/abs/2010.14322))
 * Interval Bound Propagation ([Gowal et al 2018](https://arxiv.org/pdf/1810.12715.pdf), [Mirman et al 2018](http://proceedings.mlr.press/v80/mirman18b/mirman18b.pdf))
-* Fast-Lin ([Wong and Kolter 2017](https://arxiv.org/pdf/1711.00851.pdf), [Weng et al 2018](https://arxiv.org/pdf/1804.09699.pdf))
-* CROWN ([Zhang et al 2018](https://arxiv.org/pdf/1811.00866.pdf))
+* Backward Lirpa bounds such as CAP ([Wong and Kolter 2017](https://arxiv.org/pdf/1711.00851.pdf)), FastLin([Weng et al 2018](https://arxiv.org/pdf/1804.09699.pdf)) or CROWN ([Zhang et al 2018](https://arxiv.org/pdf/1811.00866.pdf))
+* Forward Lirpa bounds ([Xu et al 2020](https://arxiv.org/pdf/2002.12920.pdf))
 * CROWN-IBP ([Zhang et al 2019](https://arxiv.org/abs/1906.06316))
 * Planet (also known as the "LP" or "triangle" relaxation, [Ehlers 2017](https://arxiv.org/abs/1705.01320)), currently using [CVXPY](https://github.com/cvxgrp/cvxpy) as the LP solver
+* MIP encoding ([Cheng et al 2017](https://arxiv.org/pdf/1705.01040.pdf), [Tjeng et al 2019](https://arxiv.org/pdf/1711.07356.pdf))
 
 ## Installation
 

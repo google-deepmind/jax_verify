@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,8 +16,16 @@
 """Utils used for JAX neural network verification."""
 
 import os
-from jax import lax
+from typing import Any, Callable, Dict, Sequence, Union
+import jax
+import jax.numpy as jnp
+from jax_verify.src import bound_propagation
+import numpy as np
 import urllib.request
+
+
+Tensor = bound_propagation.Tensor
+Bound = bound_propagation.Bound
 
 ######## File Loading ########
 
@@ -36,40 +44,111 @@ def open_file(name, *open_args, **open_kwargs):
 ######### Miscellaneous #########
 
 
-def collect_required_arguments(req_args, all_kwargs):
-  """Extract a dictionary with the required keys from a larger dictionary.
+def bind_nonbound_args(
+    fun: Callable[..., Tensor],
+    *all_in_args: Union[Bound, Tensor],
+    **kwargs
+) -> Callable[..., Tensor]:
+  """Take a function and bind all keyword arguments and non-bound arguments."""
 
-  Args:
-    req_args: List of keys to extract
-    all_kwargs: Dictionary with a superset of the required keys.
-  Returns:
-    req_args_dict: Dictionary with all the required arguments.
-  """
-  return {key: all_kwargs[key] for key in req_args}
+  def tensorbound_fun(*bound_args):
+    fun_inps = []
+    bound_arg_pos = 0
+    for arg in all_in_args:
+      if isinstance(arg, Bound):
+        fun_inps.append(bound_args[bound_arg_pos])
+        bound_arg_pos += 1
+      else:
+        fun_inps.append(arg)
+    assert len(bound_args) == bound_arg_pos
+    return fun(*fun_inps, **kwargs)
+  return tensorbound_fun
 
 
-def wrapped_general_conv(lhs, rhs, **kwargs):
-  """Wrapped version of convolution that drop extra arguments.
-
-  Args:
-    lhs: First input to the convolution
-    rhs: Second input to the convolution
-    **kwargs: Dict with the parameters of the convolution with potentially
-      some spurious parameters that the `lax.conv_general_dilated` would
-      reject.
-  Returns:
-    out: Convolution output
-  """
-  req_arguments = ['window_strides', 'padding', 'lhs_dilation',
-                   'rhs_dilation', 'dimension_numbers', 'feature_group_count',
-                   'precision']
-  lax_conv_params = collect_required_arguments(req_arguments, kwargs)
-  return lax.conv_general_dilated(lhs, rhs, **lax_conv_params)
+def filter_jaxverify_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+  if 'jax_verify_keepjvargs' in kwargs and kwargs['jax_verify_keepjvargs']:
+    return kwargs
+  else:
+    return {k: v for k, v in kwargs.items()
+            if not k.startswith('jax_verify_subgraph')}
 
 
 def simple_propagation(fn):
   """Create a wrapper function to ignore the context argument."""
   def wrapper(context, *args, **kwargs):
     del context
-    return fn(*args, **kwargs)
+    params = filter_jaxverify_kwargs(kwargs)
+    return fn(*args, **params)
   return wrapper
+
+
+def batch_value_and_grad(fun, batch_dims, *args, **kwargs):
+  """Equivalent to jax `value_and_grad` function but allows batched function.
+
+  This is to go around the fact that jax.value_and_grad only supports scalar
+  outputs.
+
+  Args:
+    fun: Function, operating in batch, to obtain gradients for.
+    batch_dims: Dimensions to batch over.
+    *args: Positional arguments for jax.value_and_grad
+    **kwargs: Named arguments for jax.value_and_grad.
+  Returns:
+    batch_value_and_grad_fn: Function returning the value and gradients of the
+      batched function
+  """
+  add_batch_dim = lambda x: jnp.expand_dims(x, batch_dims)
+  remove_batch_dim = lambda x: x.squeeze(batch_dims)
+  def nobatch_fun(*nobatch_inps):
+    batch_inps = jax.tree_util.tree_multimap(add_batch_dim, nobatch_inps)
+    batch_out = fun(*batch_inps)
+    nobatch_out = jax.tree_util.tree_multimap(remove_batch_dim, batch_out)
+    return nobatch_out
+  nobatch_value_and_grad = jax.value_and_grad(nobatch_fun, *args, **kwargs)
+
+  batch_value_and_grad_fn = nobatch_value_and_grad
+  for batch_dim in batch_dims:
+    batch_value_and_grad_fn = jax.vmap(batch_value_and_grad_fn,
+                                       in_axes=batch_dim, out_axes=batch_dim)
+  return batch_value_and_grad_fn
+
+
+def objective_chunk(
+    obj_shape: Sequence[int],
+    chunk_index: int,
+    nb_parallel_nodes: int,
+):
+  """Returns a one-hot tensor to select a chunk of elements from an objective.
+
+  Args:
+    obj_shape: Shape of the objective tensor to be chunked.
+    chunk_index: Index of the optimization chunk to generate.
+    nb_parallel_nodes: How large should the optimization chunks be. If 0,
+      optimize all problems at once.
+  Returns:
+    One-hot tensor of shape (nb_parallel_nodes, *obj_shape) specifying,
+      for each index in the chunk, an element of the objective.
+  """
+  total_nb_nodes_to_opt = int(np.prod(obj_shape))
+
+  start_node = chunk_index * nb_parallel_nodes
+  if (nb_parallel_nodes == 0) or (total_nb_nodes_to_opt <= nb_parallel_nodes):
+    nb_nodes_to_opt = total_nb_nodes_to_opt
+  else:
+    nb_nodes_to_opt = nb_parallel_nodes
+
+  # In order to be able to use the function in the while loop, we have to have
+  # all tensors remain the same size so we're going to always create a tensor
+  # of the same size, but will not necessarily fill all the rows.
+  flat_obj = jnp.zeros((nb_nodes_to_opt, total_nb_nodes_to_opt))
+  opt_idx = jnp.arange(nb_nodes_to_opt)
+  node_idx = jnp.minimum(start_node + opt_idx, total_nb_nodes_to_opt-1)
+  to_add = ((start_node + opt_idx) < total_nb_nodes_to_opt).astype(jnp.float32)
+  flat_obj = jax.ops.index_add(
+      flat_obj, (opt_idx, node_idx), to_add,
+      indices_are_sorted=True, unique_indices=False)
+  obj = jnp.reshape(flat_obj, (nb_nodes_to_opt, *obj_shape))
+
+  return obj
+
+

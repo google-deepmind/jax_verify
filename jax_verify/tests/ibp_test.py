@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import jax_verify
+import numpy as np
 
 
 class IBPTest(parameterized.TestCase):
@@ -69,8 +70,8 @@ class IBPTest(parameterized.TestCase):
     input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
     output_bounds = jax_verify.interval_bound_propagation(fun, input_bounds)
 
-    self.assertAlmostEqual(7., output_bounds.lower)
-    self.assertAlmostEqual(11., output_bounds.upper)
+    self.assertAlmostEqual(7., output_bounds.lower, delta=1e-5)
+    self.assertAlmostEqual(11., output_bounds.upper, delta=1e-5)
 
   def test_conv2d_ibp(self):
     def conv2d_model(inp):
@@ -92,31 +93,58 @@ class IBPTest(parameterized.TestCase):
     self.assertAlmostEqual(8., output_bounds.lower)
     self.assertAlmostEqual(16., output_bounds.upper)
 
-  def test_relu_ibp(self):
-    def relu_model(inp):
-      return jax.nn.relu(inp)
-    z = jnp.array([[-2., 3.]])
-
+  @parameterized.named_parameters(
+      ('exp', jnp.exp, [[-2., 3.]]),
+      ('log', jnp.log, [[3., 5.]]),
+      ('relu', jax.nn.relu, [[-2., 3.]]),
+      ('softplus', jax.nn.softplus, [[-2., 3.]]),
+      ('sign', jnp.sign, [[-2., 3.]]),
+  )
+  def test_passthrough_primitive(self, fn, inputs):
+    z = jnp.array(inputs)
     input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
-    output_bounds = jax_verify.interval_bound_propagation(relu_model,
-                                                          input_bounds)
+    output_bounds = jax_verify.interval_bound_propagation(fn, input_bounds)
 
-    self.assertArrayAlmostEqual(jnp.array([[0., 2.]]), output_bounds.lower)
-    self.assertArrayAlmostEqual(jnp.array([[0., 4.]]), output_bounds.upper)
+    self.assertArrayAlmostEqual(fn(input_bounds.lower), output_bounds.lower)
+    self.assertArrayAlmostEqual(fn(input_bounds.upper), output_bounds.upper)
 
-  def test_softplus_ibp(self):
-    def softplus_model(inp):
-      return jax.nn.softplus(inp)
-    z = jnp.array([[-2., 3.]])
+  @parameterized.named_parameters(
+      ('positive', (1.0, 4.0), (1.0, 2.0)),
+      ('negative', (-4.0, -1.0), (float('nan'), float('nan'))),
+      ('zero_edge', (0.0, 1.0), (0.0, 1.0)),
+      ('zero_cross', (-1.0, 1.0), (float('nan'), 1.0)))
+  def test_sqrt(self, input_bounds, expected):
+    input_bounds = jax_verify.IntervalBound(
+        np.array([input_bounds[0], 0.0]), np.array([input_bounds[1], 0.0]))
+    output_bounds = jax_verify.interval_bound_propagation(
+        jnp.sqrt, input_bounds)
+    np.testing.assert_array_equal(
+        np.array([expected[0], 0.0]), output_bounds.lower)
+    np.testing.assert_array_equal(
+        np.array([expected[1], 0.0]), output_bounds.upper)
 
-    input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
-    output_bounds = jax_verify.interval_bound_propagation(softplus_model,
-                                                          input_bounds)
+  @parameterized.named_parameters(
+      ('square_positive', 2, (1.0, 2.0), (1.0, 4.0)),
+      ('square_negative', 2, (-2.0, -1.0), (1.0, 4.0)),
+      ('square_zero', 2, (-1.0, 2.0), (0.0, 4.0)),
+      ('cube_positive', 3, (1.0, 2.0), (1.0, 8.0)),
+      ('cube_negative', 3, (-2.0, -1.0), (-8.0, -1.0)),
+      ('cube_zero', 3, (-1.0, 2.0), (-1.0, 8.0)))
+  def test_integer_pow(self, exponent, input_bounds, expected):
 
-    self.assertArrayAlmostEqual(jnp.logaddexp(z - 1., 0),
-                                output_bounds.lower)
-    self.assertArrayAlmostEqual(jnp.logaddexp(z + 1., 0),
-                                output_bounds.upper)
+    @jax.jit
+    def _compute_bounds(lower, upper):
+      input_bounds = jax_verify.IntervalBound(lower, upper)
+      output_bounds = jax_verify.interval_bound_propagation(
+          lambda x: x**exponent, input_bounds)
+      return output_bounds.lower, output_bounds.upper
+
+    output_bounds = _compute_bounds(
+        np.array([input_bounds[0], 0.0]), np.array([input_bounds[1], 0.0]))
+    np.testing.assert_array_equal(
+        np.array([expected[0], 0.0]), output_bounds[0])
+    np.testing.assert_array_equal(
+        np.array([expected[1], 0.0]), output_bounds[1])
 
 
 if __name__ == '__main__':

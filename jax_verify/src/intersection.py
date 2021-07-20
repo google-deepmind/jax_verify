@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,15 @@
 
 """Mechanism to combine input bounds from multiple methods."""
 
+from typing import Optional
+
 import jax
 import jax.numpy as jnp
 from jax_verify.src import bound_propagation
 
 
 Tensor = jnp.ndarray
+TransformContext = bound_propagation.TransformContext
 
 
 class IntersectionBound(bound_propagation.Bound):
@@ -42,7 +45,11 @@ class ConstrainedBound(bound_propagation.Bound):
   """Wraps a Bound with additional concrete constraints."""
 
   def __init__(
-      self, base_bound: bound_propagation.Bound, lower: Tensor, upper: Tensor):
+      self,
+      base_bound: bound_propagation.Bound,
+      lower: Optional[Tensor],
+      upper: Optional[Tensor],
+  ):
     self._base_bound = base_bound
     self._lower = lower
     self._upper = upper
@@ -52,11 +59,17 @@ class ConstrainedBound(bound_propagation.Bound):
 
   @property
   def lower(self) -> Tensor:
-    return jnp.maximum(self._base_bound.lower, self._lower)
+    if self._lower is None:
+      return self._base_bound.lower
+    else:
+      return jnp.maximum(self._base_bound.lower, self._lower)
 
   @property
   def upper(self) -> Tensor:
-    return jnp.minimum(self._base_bound.upper, self._upper)
+    if self._upper is None:
+      return self._base_bound.upper
+    else:
+      return jnp.minimum(self._base_bound.upper, self._upper)
 
 
 class IntersectionBoundTransform(bound_propagation.BoundTransform):
@@ -66,12 +79,12 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
     self._base_transforms = base_transforms
 
   def input_transform(
-      self, index: int, lower_bound: Tensor, upper_bound: Tensor
-      ) -> IntersectionBound:
+      self, context: TransformContext, lower_bound: Tensor, upper_bound: Tensor
+  ) -> IntersectionBound:
     """Constructs initial input bounds for each constituent bound type.
 
     Args:
-      index: Integer identifying the input node.
+      context: Transform context containing node index.
       lower_bound: Original concrete lower bound on the input.
       upper_bound: Original concrete upper bound on the input.
 
@@ -79,16 +92,17 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
       Intersection of the constituent input bounds.
     """
     return IntersectionBound(*[
-        transform.input_transform(index, lower_bound, upper_bound)
+        transform.input_transform(context, lower_bound, upper_bound)
         for transform in self._base_transforms])
 
   def primitive_transform(
-      self, index: int, primitive: jax.core.Primitive, *args, **kwargs
-      ) -> IntersectionBound:
+      self, context: TransformContext,
+      primitive: jax.core.Primitive, *args, **kwargs
+  ) -> IntersectionBound:
     """Propagates bounds for each constituent bound type.
 
     Args:
-      index: Integer identifying the computation node.
+      context: Transform context containing node index.
       primitive: Primitive Jax operation to transform.
       *args: Arguments of the primitive, wrapped as `IntersectionBound`s.
       **kwargs: Keyword Arguments of the primitive.
@@ -106,6 +120,13 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
 
     base_args = [base_args_for_arg(arg) for arg in args]
     return IntersectionBound(*[
-        transform.primitive_transform(index, primitive, *args, **kwargs)
-        for transform, *args in zip(
-            self._base_transforms, *base_args)])
+        transform.equation_transform(context, primitive, *args, **kwargs)
+        for transform, *args in zip(self._base_transforms, *base_args)])
+
+  def should_handle_as_subgraph(
+            self, primitive: jax.core.Primitive) -> bool:
+    # Handle as a sub-graph only if _all_ intersectands can.
+    # Otherwise handle at the higher (synthetic primitive) level.
+    return all(base_transform.should_handle_as_subgraph(primitive)
+               for base_transform in self._base_transforms)
+

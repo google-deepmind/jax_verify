@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,13 +16,14 @@
 # Lint as: python3
 """Tests for crown_boundprop.py."""
 
+import functools
 import pickle
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import jax_verify
-from jax_verify.src.sdp_verify import crown_boundprop
+from jax_verify.src.sdp_verify import boundprop_utils
 from jax_verify.src.sdp_verify import utils
 import numpy as np
 
@@ -31,7 +32,17 @@ class BoundpropTest(parameterized.TestCase):
 
   def test_crown_boundprop(self):
     """Test CROWN bounds vs FGSM on Wong-Small MNIST CNN."""
-    self._test_boundprop(crown_boundprop.boundprop)
+    crown_boundprop = functools.partial(boundprop_utils.boundprop,
+                                        boundprop_type='crown_ibp')
+    self._test_boundprop(crown_boundprop)
+
+  def test_nonconvex_boundprop(self):
+    """Test Nonconvex bounds vs FGSM on Wong-Small MNIST CNN."""
+    # Minimal test, since this already takes 70s.
+    nonconvex_boundprop = functools.partial(
+        boundprop_utils.boundprop, boundprop_type='nonconvex',
+        nonconvex_boundprop_steps=2)
+    self._test_boundprop(nonconvex_boundprop, num_idxs_to_test=1)
 
   def test_ibp_boundprop(self):
     def boundprop(params, x, epsilon, input_bounds):
@@ -40,7 +51,7 @@ class BoundpropTest(parameterized.TestCase):
       return utils.boundprop(params, init_bound)
     self._test_boundprop(boundprop)
 
-  def _test_boundprop(self, boundprop_method):
+  def _test_boundprop(self, boundprop_method, num_idxs_to_test=10):
     """Test `boundprop_method` on Wong-Small MNIST CNN."""
     with jax_verify.open_file('mnist/x_test_first100.npy', 'rb') as f:
       xs = np.load(f)
@@ -55,7 +66,6 @@ class BoundpropTest(parameterized.TestCase):
     crown_lbs = utils.flatten([b.lb_pre for b in bounds[1:]])
     crown_ubs = utils.flatten([b.ub_pre for b in bounds[1:]])
 
-    num_idxs_to_test = 10
     max_idx = crown_lbs.shape[0]
     np.random.seed(0)
     test_idxs = np.random.randint(max_idx, size=num_idxs_to_test)

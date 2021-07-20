@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,14 +17,26 @@
 
 import collections
 import functools
+from typing import Callable, Dict, Tuple, Union, List, DefaultDict, Optional
 
 import jax
 import jax.numpy as jnp
 
-from jax_verify.src import ibp
-from jax_verify.src import nonconvex
+from jax_verify.src import bound_propagation
+from jax_verify.src import synthetic_primitives
+from jax_verify.src.nonconvex import nonconvex
 
 Tensor = jnp.ndarray
+Index = bound_propagation.Index
+ParamSet = nonconvex.ParamSet
+EvalFunArgs = [ParamSet, ParamSet, ParamSet]
+WolfeDualFn = Callable[[ParamSet, Tensor, ParamSet, Tensor, Tensor, ParamSet],
+                       Tensor]
+LagrangianLevelFn = Callable[[Tensor, ParamSet], Tensor]
+LagrangianBoundingFn = Callable[[Tensor, ParamSet], Tensor]
+LagrangianVarTerm = Tuple[str, Callable[..., Tensor]]
+LagrangianDict = DefaultDict[Index, List[LagrangianVarTerm]]
+LagrangianVartermsFn = Callable[[Tensor, LagrangianDict], None]
 
 
 def _sum_fn(fn, *args, **kwargs):
@@ -33,20 +45,43 @@ def _sum_fn(fn, *args, **kwargs):
   return summand.sum(), out
 
 
-def _sum_over_acts(var):
-  return var.sum(axis=tuple(range(2, var.ndim)))
+def _sum_over_acts(var: Tensor) -> Tensor:
+  return var.sum(axis=tuple(range(1, var.ndim)))
+
+CVX_HULL_PRIMITIVES = (synthetic_primitives.relu_p,
+                       synthetic_primitives.softplus_p,
+                       synthetic_primitives.posbilinear_p,
+                       )
 
 
-class WolfeNonConvexBound(nonconvex.NonConvexBound):
+class WolfeNonConvexBound(nonconvex.ConstrainedNonConvexBound):
   """This subclass allows the computation of the WolfeDual.
 
-  This is done through the `wolfe_dual_fn`, which propagates dual variables
-    backwards and compute the contribution of this layer to the wolfe_dual.
+  This is done through the `wolfe_dual_fn`, which propagates the dual variables
+  backwards. The quantity propagated backwards (dvar) needs to
+  be split between pos_dvar (dual variable on [lb_fun() - z]) and
+  neg_dvar (dual variable on [z - ub_fun()]).
+
+  In the presence of imposed (concrete) constraints, those need to be specified
+  differently. We need:
+  (bound_posdvar - bound_negdvar) + (boundfun_posdvar - boundfun_negdvar)
+    = dvar_cte + sum_{j>i} (boundfun_posdvar_j * lb_fun()
+                             - boundfun_negdvar_j * ub_fun())
+  which means that we have degrees of freedom.
+
+  Current implementation decides based on a greedy approach, ignoring the
+  downstream consequences. This could be improved.
   """
 
-  def __init__(self, wolfe_dual_fn,
-               index, shape, previous_bounds,
-               eval_fn, variables, concretizer):
+  def __init__(
+      self,
+      wolfe_dual_fn: WolfeDualFn,
+      index: Index,
+      shape: Tuple[int, ...],
+      previous_bounds: Dict[Index, 'WolfeNonConvexBound'],
+      eval_fn: Callable[EvalFunArgs, Tensor],
+      variables: Dict[Index, Tuple[int, ...]],
+      concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Create a NonConvexBound that can compute the WolfeDual.
 
     Args:
@@ -61,106 +96,183 @@ class WolfeNonConvexBound(nonconvex.NonConvexBound):
       eval_fn: Function to evaluate the bound computation problem in the primal
       variables: Dict mapping index of activation to the shape of variables
         required to optimize them.
-      concretizer: Instance of Concretizer, used to obtain bounds over the
-        activation this object represents.
+      concretized_bounds: (Optional) Precomputed bounds for this NonConvexBound.
     """
 
-    super(WolfeNonConvexBound, self).__init__(index, shape, previous_bounds,
-                                              eval_fn, variables, concretizer)
+    super().__init__(index, shape, previous_bounds,
+                     eval_fn, variables, concretized_bounds)
     self.wolfe_dual_fn = wolfe_dual_fn
 
-  def dual(self, var_set, objectives):
-    acts = {}
-    pos_dvar = jnp.maximum(objectives, 0.)
-    neg_dvar = jnp.maximum(-objectives, 0.)
-    dual_vars = {self.index: (pos_dvar, neg_dvar)}
-    primal, acts = self.primal_fn(var_set, objectives)
-    # Compute the dual variables and at the same time, collect the terms of the
-    # wolfe dual.
+  def dual(self, var_set: ParamSet, objectives: ParamSet
+           ) -> Tuple[Tensor, Tensor]:
+    dual_vars, acts = self._compute_dualvars_convexgrad(var_set, objectives)
+    primal = self._objective_fn(acts, objectives)
+
     dual_gap = 0
     index_bound_list = list(self.previous_bounds.items())
     for index, intermediate_bound in reversed(index_bound_list):
       wolfe_dual_fn = intermediate_bound.wolfe_dual_fn
-      pos_dvar, neg_dvar = dual_vars[index]
-      wolfe_dual_contrib = wolfe_dual_fn(var_set, pos_dvar, neg_dvar,
-                                         acts, dual_vars)
+      if intermediate_bound.is_constrained():
+        wolfe_dual_contrib = wolfe_dual_fn(
+            var_set, dual_vars[index], acts,
+            intermediate_bound.lower, intermediate_bound.upper, dual_vars)
+      else:
+        wolfe_dual_contrib = wolfe_dual_fn(
+            var_set, dual_vars[index], acts, None, None, dual_vars)
       dual_gap = dual_gap + wolfe_dual_contrib
+
     wolfe_dual = primal + dual_gap
     return primal, wolfe_dual
 
   @classmethod
-  def get_initial_bound_constructor(cls, index, lb, ub):
-    def wolfe_dual_fn(var_set, pos_dvar, neg_dvar, acts, dual_vars):
+  def get_initial_bound_constructor(
+      cls: Callable[..., 'WolfeNonConvexBound'],
+      index: Index,
+      lb: Tensor,
+      ub: Tensor) -> Callable[..., 'WolfeNonConvexBound']:
+
+    def wolfe_dual_fn(var_set: ParamSet,
+                      dvar: Tensor,
+                      acts: ParamSet,
+                      bound_lb: Tensor, bound_ub: Tensor,
+                      dual_vars: ParamSet) -> Tensor:
       del var_set
+      del bound_lb
+      del bound_ub
       del dual_vars
+      pos_dvar = jnp.maximum(dvar, 0.)
+      neg_dvar = jnp.maximum(-dvar, 0.)
       x_0 = acts[index]
       dual_contrib = _sum_over_acts(pos_dvar * (lb - x_0)
                                     + neg_dvar * (x_0 - ub))
       return dual_contrib
+
     return functools.partial(cls, wolfe_dual_fn)
 
   @classmethod
-  def get_linear_activation_constructor(cls, index, vlin_fun, in_vals):
+  def get_linear_activation_constructor(
+      cls: Callable[..., 'WolfeNonConvexBound'],
+      index: Index,
+      vlin_fun: Callable[..., Tensor],
+      in_vals: List[Union['WolfeNonConvexBound', Tensor]],
+  ) -> Callable[..., 'WolfeNonConvexBound']:
 
-    def wolfe_dual_fn(var_set, pos_dvar, neg_dvar, acts, dual_vars):
+    def wolfe_dual_fn(var_set: ParamSet,
+                      dvar: Tensor,
+                      acts: ParamSet,
+                      bound_lb: Tensor, bound_ub: Tensor,
+                      dual_vars: ParamSet) -> Tensor:
+      pos_dvar = jnp.maximum(dvar, 0.)
+      neg_dvar = jnp.maximum(-dvar, 0.)
       all_inps = [nonconvex.eval_if_nonconvexbound(inp, var_set, None, acts)
                   for inp in in_vals]
 
-      posdvarp_fun = lambda x: (pos_dvar * vlin_fun(x)).sum()
-      negdvarq_fun = lambda x: (neg_dvar * vlin_fun(x)).sum()
+      if bound_lb is not None:
+        bound_fun_eval = vlin_fun(all_inps)
+        brd_bound_lb = jnp.expand_dims(bound_lb, 0)
+        brd_bound_ub = jnp.expand_dims(bound_ub, 0)
 
-      all_pp_dvars = jax.grad(posdvarp_fun)(all_inps)
-      all_nq_dvars = jax.grad(negdvarq_fun)(all_inps)
+        bound_posdvar = jnp.where(brd_bound_lb >= bound_fun_eval,
+                                  pos_dvar, jnp.zeros_like(pos_dvar))
+        pos_dvar = pos_dvar - bound_posdvar
+        bound_negdvar = jnp.where(brd_bound_ub <= bound_fun_eval,
+                                  neg_dvar, jnp.zeros_like(neg_dvar))
+        neg_dvar = neg_dvar - bound_negdvar
 
-      prev_dvars = [pp_dvar - nq_dvar
-                    for pp_dvar, nq_dvar in zip(all_pp_dvars, all_nq_dvars)]
+      _, backprop = jax.vjp(vlin_fun, all_inps)
+      all_pp_dvars = backprop(pos_dvar)[0]
+      all_nq_dvars = backprop(neg_dvar)[0]
 
-      for inp, prev_dvar in zip(in_vals, prev_dvars):
-        if not isinstance(inp, nonconvex.NonConvexBound):
+      for i, inp_i in enumerate(in_vals):
+        if not isinstance(inp_i, nonconvex.NonConvexBound):
           continue
-        prev_posdvar = jnp.maximum(prev_dvar, 0.)
-        prev_negdvar = jnp.maximum(-prev_dvar, 0.)
+        prev_dvar = all_pp_dvars[i] - all_nq_dvars[i]
+        if inp_i.index in dual_vars:
+          prev_dvar = dual_vars[inp_i.index] + prev_dvar
+        dual_vars[inp_i.index] = prev_dvar
 
-        if inp.index in dual_vars:
-          prev_posdvar = dual_vars[inp.index][0] + prev_posdvar
-          prev_negdvar = dual_vars[inp.index][1] + prev_negdvar
-        dual_vars[inp.index] = (prev_posdvar, prev_negdvar)
+      if bound_lb is not None:
+        act_out_eval = acts[index]
+        bound_fun_to_out = bound_fun_eval - act_out_eval
+        dual_contrib = _sum_over_acts(
+            jnp.where(bound_posdvar > 0,
+                      bound_posdvar * (brd_bound_lb - act_out_eval),
+                      jnp.zeros_like(bound_posdvar))
+            + jnp.where(bound_negdvar > 0,
+                        bound_negdvar * (act_out_eval - brd_bound_ub),
+                        jnp.zeros_like(bound_negdvar))
+            + (pos_dvar - neg_dvar) * bound_fun_to_out)
+        return dual_contrib
+      else:
+        # There shouldn't be a contrib term here; everything cancels out.
+        return 0
 
-      # There shouldn't be a contrib term here, everything cancels out
-      return 0
     return functools.partial(cls, wolfe_dual_fn)
 
   @classmethod
-  def get_nonlinearity_activation_constructor(cls, index, inp, act_type,
-                                              lb_fun, ub_fun):
-    def wolfe_dual_fn(var_set, pos_dvar, neg_dvar, acts, dual_vars):
-      inp_val = inp.evaluate(var_set, {}, acts)
+  def get_nonlinearity_activation_constructor(
+      cls: Callable[..., 'WolfeNonConvexBound'],
+      index: Index,
+      act_type: str,
+      lb_fun: Callable[[Tensor], Tensor],
+      ub_fun: Callable[[Tensor], Tensor],
+      *inp: 'WolfeNonConvexBound',
+  ) -> Callable[..., 'WolfeNonConvexBound']:
+    def wolfe_dual_fn(var_set: ParamSet,
+                      dvar: Tensor,
+                      acts: ParamSet,
+                      bound_lb: Tensor, bound_ub: Tensor,
+                      dual_vars: ParamSet) -> Tensor:
+      pos_dvar = jnp.maximum(dvar, 0.)
+      neg_dvar = jnp.maximum(-dvar, 0.)
+      inp_val = [inp_i.evaluate(var_set, {}, acts) for inp_i in inp]
 
-      lb_val = lb_fun(inp_val)
-      ub_val = ub_fun(inp_val)
+      lb_val, lb_backprop = jax.vjp(lb_fun, *inp_val)
+      ub_val, ub_backprop = jax.vjp(ub_fun, *inp_val)
 
-      grad_lb = jax.grad(lambda x: lb_fun(x).sum())(inp_val)
-      grad_ub = jax.grad(lambda x: ub_fun(x).sum())(inp_val)
+      if bound_lb is not None:
+        brd_bound_lb = jnp.expand_dims(bound_lb, 0)
+        brd_bound_ub = jnp.expand_dims(bound_ub, 0)
 
-      prev_dvar = (pos_dvar * grad_lb - neg_dvar * grad_ub)
-      prev_posdvar = jnp.maximum(prev_dvar, 0.)
-      prev_negdvar = jnp.maximum(-prev_dvar, 0.)
+        bound_posdvar = jnp.where(brd_bound_lb >= lb_val,
+                                  pos_dvar, jnp.zeros_like(pos_dvar))
+        pos_dvar = pos_dvar - bound_posdvar
+        bound_negdvar = jnp.where(brd_bound_ub <= ub_val,
+                                  neg_dvar, jnp.zeros_like(neg_dvar))
+        neg_dvar = neg_dvar - bound_negdvar
 
-      if inp.index in dual_vars:
-        prev_posdvar = dual_vars[inp.index][0] + prev_posdvar
-        prev_negdvar = dual_vars[inp.index][1] + prev_negdvar
-      dual_vars[inp.index] = (prev_posdvar, prev_negdvar)
+      backprop_pos = lb_backprop(pos_dvar)
+      backprop_neg = ub_backprop(neg_dvar)
+      for (i, inp_i) in enumerate(inp):
+        prev_dvar = backprop_pos[i] - backprop_neg[i]
+        if inp_i.index in dual_vars:
+          prev_dvar = dual_vars[inp_i.index] + prev_dvar
+        dual_vars[inp_i.index] = prev_dvar
 
-      theta = var_set[index]
-      out_val = lb_val + theta * (ub_val - lb_val)
+      out_val = acts[index]
 
       dual_contrib = _sum_over_acts(neg_dvar * (out_val - ub_val)
                                     + pos_dvar * (lb_val - out_val))
+      if bound_lb is not None:
+        dual_contrib = dual_contrib + _sum_over_acts(
+            jnp.where(bound_posdvar > 0,
+                      bound_posdvar * (brd_bound_lb - out_val),
+                      jnp.zeros_like(bound_posdvar))
+            + jnp.where(bound_negdvar > 0,
+                        bound_negdvar * (out_val - brd_bound_ub),
+                        jnp.zeros_like(bound_negdvar)))
       return dual_contrib
+
     return functools.partial(cls, wolfe_dual_fn)
 
+  def requires_concretizing(self, consuming_primitive):
+    needs_concretizing = (consuming_primitive is None
+                          or consuming_primitive in CVX_HULL_PRIMITIVES)
+    return (self._concretized_bounds is None) and needs_concretizing
 
-def _initial_lagrangian_term(dvar, lb, ub, x):
+
+def _initial_lagrangian_term(dvar: Tensor, lb: Tensor, ub: Tensor, x: Tensor
+                             ) -> Tensor:
   pos_dvar = jnp.maximum(dvar, 0.)
   neg_dvar = jnp.maximum(-dvar, 0.)
   dual_contrib = (neg_dvar * (x - ub) + pos_dvar * (lb - x))
@@ -177,9 +289,15 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   the feasible domain is done through the `bounding_fn` function.
   """
 
-  def __init__(self, lagrangian_level_fn, bounding_fn,
-               index, shape, previous_bounds,
-               eval_fn, variables, concretizer):
+  def __init__(self,
+               lagrangian_level_fn: LagrangianLevelFn,
+               bounding_fn: LagrangianBoundingFn,
+               index: Index,
+               shape: Tuple[int, ...],
+               previous_bounds: Dict[Index, 'LinLagrangianNonConvexBound'],
+               eval_fn: Callable[EvalFunArgs, Tensor],
+               variables: Dict[Index, Tuple[int, ...]],
+               concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Create a NonConvexBound that can compute the Linearized Lagrangian dual.
 
     Args:
@@ -196,18 +314,19 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       eval_fn: Function to evaluate the bound computation problem in the primal
       variables: Dict mapping index of activation to the shape of variables
         required to optimize them.
-      concretizer: Instance of Concretizer, used to obtain bounds over the
-        activation this object represents.
+      concretized_bounds: (Optional) Precomputed bounds for this NonConvexBound.
     """
     super(LinLagrangianNonConvexBound, self).__init__(
-        index, shape, previous_bounds, eval_fn, variables, concretizer)
+        index, shape, previous_bounds, eval_fn,
+        variables, concretized_bounds)
     self.lagrangian_level_fn = lagrangian_level_fn
     self.bounding_fn = bounding_fn
 
-    def lagrangian(acts, objectives, dual_vars):
-      final_acts = acts[self.index]
-      primals = _sum_over_acts(final_acts * objectives)
-
+    def lagrangian(acts: ParamSet,
+                   objectives: ParamSet,
+                   dual_vars: Tensor,
+                   ) -> Tuple[Tensor, ParamSet]:
+      primals = self._objective_fn(acts, objectives)
       lagrangian = primals
       for index, intermediate_bound in self.previous_bounds.items():
         lagrangian_level_fn = intermediate_bound.lagrangian_level_fn
@@ -220,8 +339,8 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     self._lagrangian_fn = lagrangian
     self._lagrangian_sumfn = functools.partial(_sum_fn, lagrangian)
 
-  def dual(self, var_set, objectives):
-    dual_vars, acts = self._compute_derivatives_dualvars(var_set, objectives)
+  def dual(self, var_set: ParamSet, objectives: ParamSet) -> Tensor:
+    dual_vars, acts = self._compute_dualvars_nonconvexgrad(var_set, objectives)
 
     # Compute the gradients of all the lagrangians (done by taking their sum),
     # with regards to the activations.
@@ -238,13 +357,17 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     return primals, lin_duals
 
   @classmethod
-  def get_initial_bound_constructor(cls, index, lb, ub):
-    def lagrangian_level_fn(dvar, acts):
+  def get_initial_bound_constructor(
+      cls: Callable[..., 'LinLagrangianNonConvexBound'],
+      index: Index,
+      lb: Tensor,
+      ub: Tensor) -> Callable[..., 'LinLagrangianNonConvexBound']:
+    def lagrangian_level_fn(dvar: Tensor, acts: ParamSet) -> Tensor:
       x_0 = acts[index]
       dual_contrib = _sum_over_acts(_initial_lagrangian_term(dvar, lb, ub, x_0))
       return dual_contrib
 
-    def bounding_fn(lag_grad, acts):
+    def bounding_fn(lag_grad: Tensor, acts: ParamSet) -> Tensor:
       x_0 = acts[index]
       bound_contrib = _sum_over_acts(jnp.maximum(lag_grad, 0.) * (lb - x_0) +
                                      jnp.minimum(lag_grad, 0.) * (ub - x_0))
@@ -252,9 +375,14 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     return functools.partial(cls, lagrangian_level_fn, bounding_fn)
 
   @classmethod
-  def get_linear_activation_constructor(cls, index, vlin_fun, in_vals):
+  def get_linear_activation_constructor(
+      cls: Callable[..., 'LinLagrangianNonConvexBound'],
+      index: Index,
+      vlin_fun: Callable[..., Tensor],
+      in_vals: Tuple[Union['LinLagrangianNonConvexBound', Tensor], ...]
+  ) -> Callable[..., 'LinLagrangianNonConvexBound']:
 
-    def lagrangian_level_fn(dvar, acts):
+    def lagrangian_level_fn(dvar: Tensor, acts: ParamSet) -> Tensor:
       act_inp_eval = [
           acts[inp.index] if isinstance(inp, nonconvex.NonConvexBound) else inp
           for inp in in_vals]
@@ -265,7 +393,7 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       dual_contrib = _sum_over_acts(dvar * (f_inp_eval - act_out_eval))
       return dual_contrib
 
-    def bounding_fn(lag_grad, acts):
+    def bounding_fn(lag_grad: Tensor, acts: ParamSet) -> Tensor:
       act_out_eval = acts[index]
 
       # We need to minimize the dotproduct between the lagrangian and the output
@@ -280,8 +408,8 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       grads = jax.grad(dot_lagrangian_output)(act_inp_eval)
       for inp, grad in zip(in_vals, grads):
         if isinstance(inp, nonconvex.NonConvexBound):
-          broad_lb = jnp.expand_dims(inp.lower, 1)
-          broad_ub = jnp.expand_dims(inp.upper, 1)
+          broad_lb = jnp.expand_dims(inp.lower, 0)
+          broad_ub = jnp.expand_dims(inp.upper, 0)
           minimizing_inps.append(jnp.where(grad >= 0, broad_lb, broad_ub))
         else:
           minimizing_inps.append(inp)
@@ -293,9 +421,18 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     return functools.partial(cls, lagrangian_level_fn, bounding_fn)
 
   @classmethod
-  def get_nonlinearity_activation_constructor(cls, index, inp, act_type,
-                                              lb_fun, ub_fun):
-    def lagrangian_level_fn(dvar, acts):
+  def get_nonlinearity_activation_constructor(
+      cls: Callable[..., 'LinLagrangianNonConvexBound'],
+      index: Index,
+      act_type: str,
+      lb_fun: Callable[[Tensor], Tensor],
+      ub_fun: Callable[[Tensor], Tensor],
+      *inp: 'LinLagrangianNonConvexBound',
+      ) -> Callable[..., 'LinLagrangianNonConvexBound']:
+    assert len(inp) == 1
+    assert act_type == 'Softplus' or act_type == 'ReLU'
+    inp = inp[0]
+    def lagrangian_level_fn(dvar: Tensor, acts: ParamSet) -> Tensor:
       pos_dvar = jnp.maximum(dvar, 0.)
       neg_dvar = jnp.maximum(-dvar, 0.)
       act_inp_eval = acts[inp.index]
@@ -315,17 +452,20 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     out_lb = lb_fun(inp.lower)
     out_ub = lb_fun(inp.upper)
 
-    def bounding_fn(lag_grad, acts):
+    def bounding_fn(lag_grad: Tensor, acts: ParamSet) -> Tensor:
       act_out_eval = acts[index]
 
-      lb_val = jnp.expand_dims(out_lb, 1)
-      ub_val = jnp.expand_dims(out_ub, 1)
+      lb_val = jnp.expand_dims(out_lb, 0)
+      ub_val = jnp.expand_dims(out_ub, 0)
       bound_contrib = _sum_over_acts(
           jnp.maximum(lag_grad, 0.) * (lb_val - act_out_eval)
           + jnp.minimum(lag_grad, 0.) * (ub_val - act_out_eval))
       return bound_contrib
 
     return functools.partial(cls, lagrangian_level_fn, bounding_fn)
+
+  def requires_concretizing(self, consuming_primitive):
+    return self._concretized_bounds is None
 
 
 class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
@@ -338,9 +478,14 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   minimize it one variable at a time.
   """
 
-  def __init__(self, lagrangian_varterms_fn,
-               index, shape, previous_bounds,
-               eval_fn, variables, concretizer):
+  def __init__(self,
+               lagrangian_varterms_fn: LagrangianVartermsFn,
+               index: Index,
+               shape: Tuple[int, ...],
+               previous_bounds: Dict[Index, 'MinLagrangianNonConvexBound'],
+               eval_fn: Callable[EvalFunArgs, Tensor],
+               variables: Dict[Index, Tuple[int, ...]],
+               concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Create a NonConvexBound that can compute the primal minimized Lagrangian.
 
     Args:
@@ -355,14 +500,15 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       eval_fn: Function to evaluate the bound computation problem in the primal
       variables: Dict mapping index of activation to the shape of variables
         required to optimize them.
-      concretizer: Instance of Concretizer, used to obtain bounds over the
-        activation this object represents.
+      concretized_bounds: (Optional) Precomputed bounds for this NonConvexBound.
     """
     super(MinLagrangianNonConvexBound, self).__init__(
-        index, shape, previous_bounds, eval_fn, variables, concretizer)
+        index, shape, previous_bounds, eval_fn, variables, concretized_bounds)
     self.lagrangian_varterms_fn = lagrangian_varterms_fn
 
-  def collect_lagrangian_varterms(self, objectives, dual_vars):
+  def collect_lagrangian_varterms(self,
+                                  objectives: ParamSet,
+                                  dual_vars: ParamSet) -> LagrangianDict:
     lagrangian_dict = collections.defaultdict(list)
     for index, intermediate_bound in self.previous_bounds.items():
       lagrangian_varterms_fn = intermediate_bound.lagrangian_varterms_fn
@@ -370,14 +516,13 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       lagrangian_varterms_fn(dvar, lagrangian_dict)
     return lagrangian_dict
 
-  def dual(self, var_set, objectives):
-    dual_vars, acts = self._compute_derivatives_dualvars(var_set, objectives)
-    nb_targets = objectives.shape[1]
+  def dual(self, var_set: ParamSet, objectives: ParamSet) -> Tensor:
+    dual_vars, acts = self._compute_dualvars_nonconvexgrad(var_set, objectives)
+    nb_targets = objectives[self.index].shape[0]
 
     # Compute the primals. This is not based on the activation minimizing the
     # lagrangian (because those are not necessarily primal feasible)
-    final_acts = acts[self.index]
-    primals = _sum_over_acts(final_acts * objectives)
+    primals = self._objective_fn(acts, objectives)
 
     lagrangian_terms = self.collect_lagrangian_varterms(objectives, dual_vars)
     # For each item in the network, we have a list of all the terms it is
@@ -385,16 +530,14 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     opt_acts = {}
     for index, lag_terms in lagrangian_terms.items():
       intermediate_bound = self.previous_bounds[index]
-      broad_lb = jnp.repeat(jnp.expand_dims(intermediate_bound.lower, axis=1),
-                            nb_targets, axis=1)
-      broad_ub = jnp.repeat(jnp.expand_dims(intermediate_bound.upper, axis=1),
-                            nb_targets, axis=1)
+      broad_lb = jnp.repeat(jnp.expand_dims(intermediate_bound.lower, axis=0),
+                            nb_targets, axis=0)
+      broad_ub = jnp.repeat(jnp.expand_dims(intermediate_bound.upper, axis=0),
+                            nb_targets, axis=0)
       opt_acts[index] = _optimize_lagrangian_terms(lag_terms,
                                                    broad_lb, broad_ub)
 
-    final_opt_acts = opt_acts[self.index]
-    opt_primals = _sum_over_acts(final_opt_acts * objectives)
-    minimized_lagrangian = opt_primals
+    minimized_lagrangian = self._objective_fn(opt_acts, objectives)
     for index, lag_terms in lagrangian_terms.items():
       for term in lag_terms:
         out_term = term[1](opt_acts[index])
@@ -403,16 +546,25 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     return primals, minimized_lagrangian
 
   @classmethod
-  def get_initial_bound_constructor(cls, index, lb, ub):
-    def lagrangian_varterms_fn(dvar, lagrangian_dict):
+  def get_initial_bound_constructor(
+      cls: Callable[..., 'MinLagrangianNonConvexBound'],
+      index: Index,
+      lb: Tensor,
+      ub: Tensor) -> Callable[..., 'MinLagrangianNonConvexBound']:
+    def lagrangian_varterms_fn(dvar: Tensor, lagrangian_dict: LagrangianDict):
       lagrangian_dict[index].append(
           ('Linear', functools.partial(_initial_lagrangian_term, dvar, lb, ub)))
     return functools.partial(cls, lagrangian_varterms_fn)
 
   @classmethod
-  def get_linear_activation_constructor(cls, index, vlin_fun, in_vals):
+  def get_linear_activation_constructor(
+      cls: Callable[..., 'MinLagrangianNonConvexBound'],
+      index: Index,
+      vlin_fun: Callable[..., Tensor],
+      in_vals: List[Union['MinLagrangianNonConvexBound', Tensor]],
+  ) -> Callable[..., 'MinLagrangianNonConvexBound']:
 
-    def lagrangian_varterms_fn(dvar, lagrangian_dict):
+    def lagrangian_varterms_fn(dvar: Tensor, lagrangian_dict: LagrangianDict):
       # There is a linear term of dvar over the outputs.
       lagrangian_dict[index].append(('Linear', lambda x: (-dvar*x)))
 
@@ -439,7 +591,7 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
             # Add the opt dimension, and put in all the examples to 0, so that
             # we can identify the bias term.
             shape = inp.shape
-            inp_shape = (shape[0], dvar.shape[1]) + shape[1:]
+            inp_shape = (dvar.shape[0],) + shape
             example_inp = jnp.zeros(inp_shape)
             inps.append(example_inp)
           else:
@@ -463,9 +615,18 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     return functools.partial(cls, lagrangian_varterms_fn)
 
   @classmethod
-  def get_nonlinearity_activation_constructor(cls, index, inp, act_type,
-                                              lb_fun, ub_fun):
-    def lagrangian_varterms_fn(dvar, lagrangian_dict):
+  def get_nonlinearity_activation_constructor(
+      cls: Callable[..., 'MinLagrangianNonConvexBound'],
+      index: Index,
+      act_type: str,
+      lb_fun: Callable[[Tensor], Tensor],
+      ub_fun: Callable[[Tensor], Tensor],
+      *inp: 'MinLagrangianNonConvexBound',
+      ) -> Callable[..., 'MinLagrangianNonConvexBound']:
+    assert len(inp) == 1
+    assert act_type == 'Softplus' or act_type == 'ReLU'
+    inp = inp[0]
+    def lagrangian_varterms_fn(dvar: Tensor, lagrangian_dict: LagrangianDict):
       # There is a linear term of dvar over the outputs.
       lagrangian_dict[index].append(('Linear', lambda x: (-dvar*x)))
       # For the inputs, there is a linear term through the upper bound:
@@ -479,8 +640,13 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
           (act_type, lambda x: (pos_dvar * lb_fun(x))))
     return functools.partial(cls, lagrangian_varterms_fn)
 
+  def requires_concretizing(self, consuming_primitive):
+    return self._concretized_bounds is None
 
-def _optimize_lagrangian_terms(lagrangian_terms, lower_bound, upper_bound):
+
+def _optimize_lagrangian_terms(lagrangian_terms: List[LagrangianVarTerm],
+                               lower_bound: Tensor,
+                               upper_bound: Tensor) -> Tensor:
   """Minimize the part of the lagrangian corresponding to a given variable.
 
   Args:
@@ -522,8 +688,10 @@ def _optimize_lagrangian_terms(lagrangian_terms, lower_bound, upper_bound):
                                             lower_bound, upper_bound)
 
 
-def _optimize_softplus_lagrangian(lin_coeffs, nonlin_term,
-                                  lower_bound, upper_bound):
+def _optimize_softplus_lagrangian(lin_coeffs: Tensor,
+                                  nonlin_term: Callable[[Tensor], Tensor],
+                                  lower_bound: Tensor,
+                                  upper_bound: Tensor) -> Tensor:
   """Compute the input minimizing a sum of a linear term and a softplus.
 
   To minimize a * softplus(x) + b  * x
@@ -566,8 +734,10 @@ def _optimize_softplus_lagrangian(lin_coeffs, nonlin_term,
                             a_min=lower_bound, a_max=upper_bound))
 
 
-def _optimize_relu_lagrangian(lin_coeffs, nonlin_term,
-                              lower_bound, upper_bound):
+def _optimize_relu_lagrangian(lin_coeffs: Tensor,
+                              nonlin_term: Callable[[Tensor], Tensor],
+                              lower_bound: Tensor,
+                              upper_bound: Tensor) -> Tensor:
   """Compute the input minimizing a sum of a linear term and a ReLU.
 
   To minimize a * relu(x) + b * x,
@@ -596,9 +766,3 @@ _lagrangian_opt_fns = {
     'ReLU': _optimize_relu_lagrangian,
     'Softplus': _optimize_softplus_lagrangian
 }
-
-nonconvex_ibp_bound_propagation = functools.partial(
-    nonconvex.build_nonconvex_formulation,
-    WolfeNonConvexBound,
-    lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform)
-)

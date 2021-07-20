@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The jax_verify Authors.
+# Copyright 2021 The jax_verify Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -157,9 +157,11 @@ class BoundPropagationTest(parameterized.TestCase):
     fun_to_prop = functools.partial(model.apply, params)
     for boundprop_method in [
         jax_verify.interval_bound_propagation,
-        jax_verify.crown_bound_propagation,
-        jax_verify.fastlin_bound_propagation,
-        jax_verify.ibpfastlin_bound_propagation,
+        jax_verify.forward_crown_bound_propagation,
+        jax_verify.backward_crown_bound_propagation,
+        jax_verify.forward_fastlin_bound_propagation,
+        jax_verify.backward_fastlin_bound_propagation,
+        jax_verify.ibpforwardfastlin_bound_propagation,
     ]:
       output_bounds = boundprop_method(fun_to_prop, input_bounds)
       _check_matching_structures(model_output, output_bounds)

@@ -30,6 +30,7 @@ verified bounds for these networks.
 
 The methods currently provided by `jax_verify` include:
 
+* Functional Lagrangian (coming) [Berrada et al 2021](https://arxiv.org/abs/2102.09479)
 * SDP-FO (first-order SDP verification, [Dathathri et al 2020](https://arxiv.org/abs/2010.11645))
 * Non-convex ([Bunel et al 2020](https://arxiv.org/abs/2010.14322))
 * Interval Bound Propagation ([Gowal et al 2018](https://arxiv.org/pdf/1810.12715.pdf), [Mirman et al 2018](http://proceedings.mlr.press/v80/mirman18b/mirman18b.pdf))

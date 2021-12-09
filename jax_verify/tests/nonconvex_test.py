@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,22 +36,8 @@ from jax_verify.src.mip_solver import relaxation
 from jax_verify.src.nonconvex import duals
 from jax_verify.src.nonconvex import nonconvex
 from jax_verify.src.nonconvex import optimizers
-from jax_verify.src.sdp_verify import utils
 from jax_verify.tests import test_utils
-from jax_verify.tests.sdp_verify import test_utils as sdp_test_utils
 import numpy as np
-
-
-def _set_up_toy_problem(rng_key, batch_size, architecture):
-  key_1, key_2 = jax.random.split(rng_key)
-  params = sdp_test_utils.make_mlp_params(architecture, key_2)
-
-  inputs = jax.random.uniform(key_1, (batch_size, architecture[0]))
-  eps = 0.1
-  lb = jnp.maximum(jnp.minimum(inputs - eps, 1.), 0.)
-  ub = jnp.maximum(jnp.minimum(inputs + eps, 1.), 0.)
-  fun = functools.partial(utils.predict_cnn, params)
-  return fun, (lb, ub)
 
 
 def _random_objectives_primal_variables(rng_key, nonconvex_bound,
@@ -205,15 +191,17 @@ class NonConvexBoundTest(parameterized.TestCase):
     nb_opt_targets = 3
     key = jax.random.PRNGKey(42)
     problem_key, var_key = jax.random.split(key)
-    fun, (lb, ub) = _set_up_toy_problem(problem_key, batch_size, [64, 2, 2, 2])
+    fun, (lb, ub) = test_utils.set_up_toy_problem(problem_key, batch_size,
+                                                  [64, 2, 2, 2])
     input_bounds = jax_verify.IntervalBound(lb, ub)
 
-    nonconvex_ibp_bound_propagation = functools.partial(
-        nonconvex.build_nonconvex_formulation,
-        bound_cls, lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform))
+    algorithm = nonconvex.nonconvex_algorithm(
+        bound_cls, nonconvex.BaseBoundConcretizer(),
+        base_boundprop=ibp.bound_transform)
 
     # NonConvex bound
-    nonconvex_ibp_bounds = nonconvex_ibp_bound_propagation(fun, input_bounds)
+    nonconvex_ibp_bounds, _ = bound_propagation.bound_propagation(
+        algorithm, fun, input_bounds)
     objectives, var_set = _random_objectives_primal_variables(
         var_key, nonconvex_ibp_bounds, nb_opt_targets)
 
@@ -225,22 +213,23 @@ class NonConvexBoundTest(parameterized.TestCase):
     nb_opt_targets = 3
     key = jax.random.PRNGKey(42)
     problem_key, primal_var_key, dual_var_key = jax.random.split(key, num=3)
-    fun, (lb, ub) = _set_up_toy_problem(problem_key, batch_size, [32, 18, 2])
+    fun, (lb, ub) = test_utils.set_up_toy_problem(problem_key, batch_size,
+                                                  [32, 18, 2])
     input_bounds = jax_verify.IntervalBound(lb, ub)
 
     # Get the MinLagrangian and LinLagrangian propagation
-    linlag_bound_propagation = functools.partial(
-        nonconvex.build_nonconvex_formulation,
+    linlag_bound_algorithm = nonconvex.nonconvex_algorithm(
         duals.LinLagrangianNonConvexBound,
-        lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform))
-    minlag_bound_propagation = functools.partial(
-        nonconvex.build_nonconvex_formulation,
+        nonconvex.BaseBoundConcretizer(), base_boundprop=ibp.bound_transform)
+    minlag_bound_algorithm = nonconvex.nonconvex_algorithm(
         duals.MinLagrangianNonConvexBound,
-        lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform))
+        nonconvex.BaseBoundConcretizer(), base_boundprop=ibp.bound_transform)
 
     # NonConvex bound
-    linlag_bound = linlag_bound_propagation(fun, input_bounds)
-    minlag_bound = minlag_bound_propagation(fun, input_bounds)
+    linlag_bound, _ = bound_propagation.bound_propagation(
+        linlag_bound_algorithm, fun, input_bounds)
+    minlag_bound, _ = bound_propagation.bound_propagation(
+        minlag_bound_algorithm, fun, input_bounds)
 
     objectives, var_set = _random_objectives_primal_variables(
         primal_var_key, linlag_bound, nb_opt_targets)
@@ -282,22 +271,23 @@ class NonConvexBoundTest(parameterized.TestCase):
     nb_opt_targets = 3
     key = jax.random.PRNGKey(42)
     problem_key, primal_var_key, dual_var_key = jax.random.split(key, num=3)
-    fun, (lb, ub) = _set_up_toy_problem(problem_key, batch_size, [64, 2, 2, 2])
+    fun, (lb, ub) = test_utils.set_up_toy_problem(problem_key, batch_size,
+                                                  [64, 2, 2, 2])
     input_bounds = jax_verify.IntervalBound(lb, ub)
 
     # Get the MinLagrangian and LinLagrangian propagation
-    linlag_bound_propagation = functools.partial(
-        nonconvex.build_nonconvex_formulation,
+    linlag_bound_algorithm = nonconvex.nonconvex_algorithm(
         duals.LinLagrangianNonConvexBound,
-        lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform))
-    minlag_bound_propagation = functools.partial(
-        nonconvex.build_nonconvex_formulation,
+        nonconvex.BaseBoundConcretizer(), base_boundprop=ibp.bound_transform)
+    minlag_bound_algorithm = nonconvex.nonconvex_algorithm(
         duals.MinLagrangianNonConvexBound,
-        lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform))
+        nonconvex.BaseBoundConcretizer(), base_boundprop=ibp.bound_transform)
 
     # NonConvex bound
-    linlag_bound = linlag_bound_propagation(fun, input_bounds)
-    minlag_bound = minlag_bound_propagation(fun, input_bounds)
+    linlag_bound, _ = bound_propagation.bound_propagation(
+        linlag_bound_algorithm, fun, input_bounds)
+    minlag_bound, _ = bound_propagation.bound_propagation(
+        minlag_bound_algorithm, fun, input_bounds)
 
     objectives, var_set = _random_objectives_primal_variables(
         primal_var_key, minlag_bound, nb_opt_targets)
@@ -361,14 +351,15 @@ class NonConvexBoundTest(parameterized.TestCase):
   def test_comparefista_to_cvxpy(self, bound_cls):
     batch_size = 2
     key = jax.random.PRNGKey(42)
-    fun, (lb, ub) = _set_up_toy_problem(key, batch_size, [32, 18, 2])
+    fun, (lb, ub) = test_utils.set_up_toy_problem(key, batch_size, [32, 18, 2])
     input_bounds = jax_verify.IntervalBound(lb, ub)
 
     # NonConvex Result
-    nonconvex_ibp_bound_propagation = functools.partial(
-        nonconvex.build_nonconvex_formulation,
-        bound_cls, lambda: nonconvex.BaseBoundConcretizer(ibp.bound_transform))
-    nonconvex_ibp_bounds = nonconvex_ibp_bound_propagation(fun, input_bounds)
+    nonconvex_ibp_bound_algorithm = nonconvex.nonconvex_algorithm(
+        bound_cls, nonconvex.BaseBoundConcretizer(),
+        base_boundprop=ibp.bound_transform)
+    nonconvex_ibp_bounds, _ = bound_propagation.bound_propagation(
+        nonconvex_ibp_bound_algorithm, fun, input_bounds)
     fista_optimizer = optimizers.LinesearchFistaOptimizer(
         40, beta_l=0.8, termination_dual_gap=1e-6)
     fista_concretizer = optimizers.OptimizingConcretizer(
@@ -410,7 +401,7 @@ class NonConvexBoundTest(parameterized.TestCase):
     batch_size = 3
     key = jax.random.PRNGKey(42)
 
-    fun, (lb, ub) = _set_up_toy_problem(key, batch_size, [32, 16, 10])
+    fun, (lb, ub) = test_utils.set_up_toy_problem(key, batch_size, [32, 16, 10])
     input_bounds = jax_verify.IntervalBound(lb, ub)
 
     nonconvex_bound = jax_verify.nonconvex_ibp_bound_propagation(
@@ -435,7 +426,8 @@ class NonConvexBoundTest(parameterized.TestCase):
     key = jax.random.PRNGKey(42)
     problem_key, objective_key = jax.random.split(key)
 
-    fun, (lb, ub) = _set_up_toy_problem(problem_key, batch_size, [32, 16, 10])
+    fun, (lb, ub) = test_utils.set_up_toy_problem(problem_key, batch_size,
+                                                  [32, 16, 10])
     input_bounds = jax_verify.IntervalBound(lb, ub)
     nonconvex_bound = jax_verify.nonconvex_ibp_bound_propagation(
         fun, input_bounds)

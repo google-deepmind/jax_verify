@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,46 @@ from jax import numpy as jnp
 from jax_verify.src import synthetic_primitives
 
 
-class ActivationDetectorTest(parameterized.TestCase):
+class SyntheticPrimitiveDetectorTest(parameterized.TestCase):
+
+  def _check_correct_impl(self, graph, simplifier, var_is_bound, *inps):
+    simplified_graph = synthetic_primitives.simplify_graph(simplifier, graph,
+                                                           var_is_bound)
+
+    graph_outs = jax.core.eval_jaxpr(graph, [], *inps)
+    simple_graph_outs = jax.core.eval_jaxpr(simplified_graph, [], *inps)
+
+    for graph_out, simple_graph_out in zip(graph_outs, simple_graph_outs):
+      self.assertAlmostEqual(jnp.abs(graph_out - simple_graph_out).max(),
+                             0., delta=1e-6)
+
+  def _find_eqn_in_simplified_graph(self, graph, simplifier, var_is_bound,
+                                    primitive):
+    # Check if the primitive is present. This imitates the recursive
+    # parsing done in bound_propagation, because depending on the platform,
+    # the primitive might be wrapped in a `custom_jvp_call_jaxpr_p`
+    # The loop is necessarily terminating because we always remove one level of
+    # nesting in the graph, so we will necessarily reach a level with no
+    # subgraph.
+    simplified_graph = synthetic_primitives.simplify_graph(simplifier, graph,
+                                                           var_is_bound)
+    for eqn in simplified_graph.eqns:
+      sub_graph = synthetic_primitives.jax_primitive_subgraph(eqn)
+
+      if sub_graph is not None:
+        subgraph_var_is_bound = {
+            sub_invar: var_is_bound[eqn_invar] for sub_invar, eqn_invar
+            in zip(sub_graph.invars, eqn.invars)}
+        match = self._find_eqn_in_simplified_graph(
+            sub_graph, simplifier, subgraph_var_is_bound, primitive)
+        if match:
+          return match
+      elif eqn.primitive == primitive:
+        return eqn
+    return None
+
+
+class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
 
   @parameterized.named_parameters(('jit', True), ('nojit', False))
   def test_softplus_detected(self, use_jit):
@@ -224,6 +263,32 @@ class ActivationDetectorTest(parameterized.TestCase):
         var_is_bound, inp)
 
   @parameterized.named_parameters(('jit', True), ('nojit', False))
+  def test_sigmoid_detected(self, use_jit):
+
+    def sigmoid_model(x):
+      return jax.nn.sigmoid(x)
+
+    if use_jit:
+      sigmoid_model = jax.jit(sigmoid_model)
+
+    inp = jnp.array([[-2., 3.]])
+    jaxpr_maker = jax.make_jaxpr(sigmoid_model)
+    parsed = jaxpr_maker(inp)
+    var_is_bound = {parsed.jaxpr.invars[0]: True}
+
+    match = self._find_eqn_in_simplified_graph(
+        parsed.jaxpr,
+        synthetic_primitives.activation_simplifier,
+        var_is_bound,
+        synthetic_primitives.sigmoid_p)
+
+    self.assertIsNotNone(match)
+
+    self._check_correct_impl(
+        parsed.jaxpr, synthetic_primitives.activation_simplifier,
+        var_is_bound, inp)
+
+  @parameterized.named_parameters(('jit', True), ('nojit', False))
   def test_linear_detected(self, use_jit):
 
     inp = jnp.array([[-1., 1.]])
@@ -271,43 +336,6 @@ class ActivationDetectorTest(parameterized.TestCase):
     self._check_correct_impl(
         parsed.jaxpr, synthetic_primitives.group_linear_sequence,
         var_is_bound, inp, w1, b1)
-
-  def _check_correct_impl(self, graph, simplifier, var_is_bound, *inps):
-    simplified_graph = synthetic_primitives.simplify_graph(simplifier, graph,
-                                                           var_is_bound)
-
-    graph_outs = jax.core.eval_jaxpr(graph, [], *inps)
-    simple_graph_outs = jax.core.eval_jaxpr(simplified_graph, [], *inps)
-
-    for graph_out, simple_graph_out in zip(graph_outs, simple_graph_outs):
-      self.assertAlmostEqual(jnp.abs(graph_out - simple_graph_out).max(),
-                             0., delta=1e-6)
-
-  def _find_eqn_in_simplified_graph(self, graph, simplifier, var_is_bound,
-                                    primitive):
-    # Check if the primitive is present. This imitates the recursive
-    # parsing done in bound_propagation, because depending on the platform,
-    # the primitive might be wrapped in a `custom_jvp_call_jaxpr_p`
-    # The loop is necessarily terminating because we always remove one level of
-    # nesting in the graph, so we will necessarily reach a level with no
-    # subgraph.
-    simplified_graph = synthetic_primitives.simplify_graph(simplifier, graph,
-                                                           var_is_bound)
-    for eqn in simplified_graph.eqns:
-      sub_graph = synthetic_primitives.jax_primitive_subgraph(eqn)
-
-      if sub_graph is not None:
-        subgraph_var_is_bound = {
-            sub_invar: var_is_bound[eqn_invar] for sub_invar, eqn_invar
-            in zip(sub_graph.invars, eqn.invars)}
-        match = self._find_eqn_in_simplified_graph(
-            sub_graph, simplifier, subgraph_var_is_bound, primitive)
-        if match:
-          return match
-      elif eqn.primitive == primitive:
-        return eqn
-    return None
-
 
 if __name__ == '__main__':
   absltest.main()

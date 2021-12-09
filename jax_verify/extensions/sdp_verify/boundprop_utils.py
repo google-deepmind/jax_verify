@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,11 +20,12 @@
 import functools
 import jax.numpy as jnp
 import jax_verify
+from jax_verify.extensions.sdp_verify import utils
+from jax_verify.src import bound_propagation
 from jax_verify.src.nonconvex import duals
 from jax_verify.src.nonconvex import nonconvex
 from jax_verify.src.nonconvex import optimizers
 from jax_verify.src.nonconvex.optimizers import LinesearchFistaOptimizer as FistaOptimizer
-from jax_verify.src.sdp_verify import utils
 IntBound = utils.IntBound
 
 
@@ -93,15 +94,15 @@ def _nonconvex_boundprop(params, x, epsilon, input_bounds,
   # Collect the intermediate bounds.
   input_bound = jax_verify.IntervalBound(init_bounds.lb, init_bounds.ub)
 
-  def _create_optimizer():
-    return optimizers.OptimizingConcretizer(
-        FistaOptimizer(num_steps=nonconvex_boundprop_steps),
-        max_parallel_nodes=nonconvex_boundprop_nodes)
-  nonconvex_bound_propagation = functools.partial(
-      nonconvex.build_nonconvex_formulation,
-      duals.WolfeNonConvexBound, _create_optimizer)
-  _, intermediate_nonconvex_bounds = nonconvex_bound_propagation(
-      all_act_fun, input_bound)
+  optimizer = optimizers.OptimizingConcretizer(
+      FistaOptimizer(num_steps=nonconvex_boundprop_steps),
+      max_parallel_nodes=nonconvex_boundprop_nodes)
+  nonconvex_algorithm = nonconvex.nonconvex_algorithm(
+      duals.WolfeNonConvexBound, optimizer)
+
+  all_outputs, _ = bound_propagation.bound_propagation(
+      nonconvex_algorithm, all_act_fun, input_bound)
+  _, intermediate_nonconvex_bounds = all_outputs
 
   bounds = [init_bounds]
   for nncvx_bound in intermediate_nonconvex_bounds:

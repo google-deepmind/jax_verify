@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ from jax_verify.src.linear import linear_bound_utils
 from jax_verify.tests import test_utils
 
 import numpy as np
+import optax
 
 
 class BackwardCrownBoundTest(parameterized.TestCase):
@@ -51,8 +52,10 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     params = {'linear':
               {'w': jnp.ones((3, 1), dtype=jnp.float32),
                'b': jnp.array([2.])}}
-    input_bounds = jax_verify.IntervalBound(z-1., z+1.)
     fun = functools.partial(linear_model.apply, params)
+
+    # Test with standard interval bounds.
+    input_bounds = jax_verify.IntervalBound(z-1., z+1.)
     output_bounds = jax_verify.backward_crown_bound_propagation(
         fun, input_bounds)
 
@@ -75,6 +78,8 @@ class BackwardCrownBoundTest(parameterized.TestCase):
                'b': jnp.array([2.])}}
 
     fun = functools.partial(conv2d_model.apply, params)
+
+    # Test with standard interval bounds
     input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
     output_bounds = jax_verify.backward_crown_bound_propagation(
         fun, input_bounds)
@@ -112,10 +117,10 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     empirical_max = uniform_outs.max(axis=0)
 
     self.assertGreaterEqual((output_bounds.upper - empirical_max).min(), 0.,
-                            'Invalid upper bound for Exponential. The gap '
+                            'Invalid upper bound for AbsValue. The gap '
                             'between upper bound and empirical max is < 0')
     self.assertGreaterEqual((empirical_min - output_bounds.lower).min(), 0.,
-                            'Invalid lower bound for Exponential. The gap'
+                            'Invalid lower bound for AbsValue. The gap'
                             'between emp. min and lower bound is negative.')
 
   def test_leaky_relu_crown(self):
@@ -230,7 +235,29 @@ class BackwardCrownBoundTest(parameterized.TestCase):
                             'Invalid lower bound for mix of batched/unbatched'
                             'input bounds.')
 
-  def test_chunking(self):
+  def test_equal_bounds_parameterized(self):
+    model = jax.nn.relu
+    sample_value = jnp.array([-1., 1.])
+    inp_bound = jax_verify.IntervalBound(sample_value, sample_value)
+
+    concretizer = backward_crown.ChunkedBackwardConcretizer(
+        backward_crown.OptimizingLinearBoundBackwardTransform(
+            linear_bound_utils.parameterized_relaxer,
+            backward_crown.CONCRETIZE_ARGS_PRIMITIVE,
+            optax.adam(1.e-3), num_opt_steps=10))
+
+    algorithm = bound_utils.BackwardConcretizingAlgorithm(concretizer)
+    bound, _ = bound_propagation.bound_propagation(
+        algorithm, model, inp_bound)
+
+    np.testing.assert_array_almost_equal(bound.lower, bound.upper)
+
+  @parameterized.named_parameters(
+      ('crown', linear_bound_utils.crown_rvt_relaxer),
+      ('fastlin', linear_bound_utils.fastlin_rvt_relaxer),
+      ('parameterized', linear_bound_utils.parameterized_relaxer),
+  )
+  def test_chunking(self, relaxer):
     batch_size = 3
     input_size = 2
     hidden_size = 5
@@ -256,12 +283,18 @@ class BackwardCrownBoundTest(parameterized.TestCase):
       final = act @ final_lay_weight
       return final
 
-    relaxer = linear_bound_utils.crown_rvt_relaxer
-    concretizing_transform = backward_crown.LinearBoundBackwardTransform(
-        relaxer, backward_crown.CONCRETIZE_ARGS_PRIMITIVE)
-    chunked_concretizer = backward_crown.LinearBoundBackwardConcretizer(
+    if isinstance(relaxer, linear_bound_utils.ParameterizedLinearBoundsRelaxer):
+      concretizing_transform = (
+          backward_crown.OptimizingLinearBoundBackwardTransform(
+              relaxer, backward_crown.CONCRETIZE_ARGS_PRIMITIVE,
+              optax.adam(1.e-3), num_opt_steps=10))
+    else:
+      concretizing_transform = backward_crown.LinearBoundBackwardTransform(
+          relaxer, backward_crown.CONCRETIZE_ARGS_PRIMITIVE)
+
+    chunked_concretizer = backward_crown.ChunkedBackwardConcretizer(
         concretizing_transform, max_chunk_size=16)
-    unchunked_concretizer = backward_crown.LinearBoundBackwardConcretizer(
+    unchunked_concretizer = backward_crown.ChunkedBackwardConcretizer(
         concretizing_transform, max_chunk_size=0)
 
     chunked_algorithm = bound_utils.BackwardConcretizingAlgorithm(

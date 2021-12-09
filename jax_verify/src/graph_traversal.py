@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ This is accomplished by traversing the JaxPR representation of the computation.
 """
 import abc
 import collections
+import dataclasses
 import functools
 from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar, Union
 
-import dataclasses
 import jax
 import jax.numpy as jnp
 
@@ -50,9 +50,15 @@ class InputBound(metaclass=abc.ABCMeta):
 
 # (lower, upper) input bound represented as a Tensor nest so that it can
 # be passed as a parameter to a Jax jitted function.
+# `bound_type` should be a dictionary using the desired bound class as a key
+# (the value that the key maps to is unimportant). This way, jax does not
+# complain about it not being a jax type.
+# Example: {jax_verify.IntervalBound: None}
+# Additional arguments can be provided in `kwargs`,
+# The Bound class should implement a `from_jittable` class method, to
+# instantiate the object based on the jittable bound.
 JittableInputBound = collections.namedtuple(
-    'JittableInputBound', ['lower', 'upper'])
-
+    'JittableInputBound', ['lower', 'upper', 'bound_type', 'kwargs'])
 
 GraphInput = Union[InputBound, JittableInputBound, Tensor]
 
@@ -420,8 +426,8 @@ class PropagationGraph:
     return self._index_to_node[index]
 
   @property
-  def indices(self) -> Sequence[Index]:
-    return self._index_to_node.keys()
+  def indices(self) -> List[Index]:
+    return list(self._index_to_node.keys())
 
   def forward_propagation(
       self,
@@ -676,11 +682,14 @@ class PropagationGraph:
     # Decrement the index to match the indexing in the forward propagation.
     index.decr()
 
-    if len(eqn.outvars) != 1:
-      # TODO Handle multi out primitives.
-      raise NotImplementedError('Multiple outputs primitives not supported.')
-
-    if isinstance(read_env(forward_env, eqn.outvars[0]), TransformedNode):
+    if all(not isinstance(read_env(forward_env, outvar), TransformedNode)
+           for outvar in eqn.outvars):
+      # None of the outputs are bounds, which means that there is no dependency
+      # on the network's bound inputs.
+      eqn_invals = [[None] for _ in eqn.invars]
+    elif len(eqn.outvars) == 1:
+      # If there is only a single output and it's a bound, perform backward
+      # transformation
       if eqn.outvars[0] != self._index_to_node[index.as_tuple()]:
         raise ValueError('Forward/backward indexing mismatch')
       # Check if a repr is being propagated backward through this primitive.
@@ -712,9 +721,10 @@ class PropagationGraph:
         # bound was defined on them.
         eqn_invals = []
     else:
-      # No dependence on the network's variable inputs.
-      eqn_invals = [[None] for _ in eqn.invars]
-
+      # This multi output primitive produces a bound, which is not
+      # supported yet.
+      raise NotImplementedError('Multiple outputs primitives are not '
+                                'supported.')
     for in_var, in_val in zip(eqn.invars, eqn_invals):
       # If it's a literal, there are no updates to perform.
       if not isinstance(in_var, jax.core.Literal):

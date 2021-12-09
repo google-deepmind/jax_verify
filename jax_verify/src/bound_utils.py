@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ Nest = bound_propagation.Nest
 Tensor = jnp.ndarray
 LayerInput = Union[Bound, Tensor]
 Primitive = bound_propagation.Primitive
-T = TypeVar('T')
+T = TypeVar('T', bound=graph_traversal.TransformedNode)
 
 
 class FixedBoundApplier(bound_propagation.BoundTransform):
@@ -120,11 +120,12 @@ class BoundRetrieverAlgorithm(bound_propagation.PropagationAlgorithm[Bound]):
 
   def propagate(
       self, graph: bound_propagation.PropagationGraph,
-      bounds: Nest[GraphInput],
+      inputs: Nest[GraphInput],
   ) -> Tuple[Nest[Bound], Dict[jax.core.Var, LayerInput]]:
-    outvals, env = self._base_algorithm.propagate(graph, bounds)
-    self._base_bounds = {index: env[graph.jaxpr_node(index)]
-                         for index in graph.indices}
+    outvals, env = self._base_algorithm.propagate(graph, inputs)
+    self._base_bounds = {
+        index: graph_traversal.read_env(env, graph.jaxpr_node(index))
+        for index in graph.indices}
     return outvals, env
 
   @property
@@ -184,11 +185,11 @@ class GraphNode(bound_propagation.Bound):
 
   @property
   def lower(self):
-    raise NotImplementedError()
+    return -float('inf') * jnp.ones(self._shape)
 
   @property
   def upper(self):
-    raise NotImplementedError()
+    return -float('inf') * jnp.ones(self._shape)
 
 
 class GraphInspector(bound_propagation.GraphTransform[GraphNode]):
@@ -232,6 +233,29 @@ class BackwardConcretizingTransform(bound_propagation.BackwardGraphTransform[T],
       primitive: Primitive that we are encountering.
     """
 
+  @abc.abstractmethod
+  def concrete_bound_chunk(
+      self,
+      graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput],
+      env: Dict[jax.core.Var, LayerInput],
+      node: jax.core.Var,
+      obj: Tensor,
+  ) -> Tensor:
+    """Computes concrete bounds for a chunk of neurons in the given layer.
+
+    Args:
+      graph: Graph to perform Backward Propagation on.
+      inputs: Bounds on the inputs.
+      env: Environment containing intermediate bound and shape information.
+      node: Graph node to obtain a bound for.
+      obj: One-hot tensor of shape (chunk_size, *node_shape) specifying,
+        for each index in the chunk, an element of the objective. Non-zero
+        entries may be +1 or -1 to request lower or upper bounds respectively.
+    Returns:
+      Bound of shape (chunk_size,) on the activation at `node`.
+    """
+
 
 class BackwardConcretizer(metaclass=abc.ABCMeta):
   """Abstract producer of concretize bounds by back-propagation."""
@@ -249,17 +273,20 @@ class BackwardConcretizer(metaclass=abc.ABCMeta):
     """
 
   @abc.abstractmethod
-  def concrete_bound(self, node: jax.core.Var,
-                     graph: bound_propagation.PropagationGraph,
-                     env: Dict[jax.core.Var, LayerInput],
-                     *bounds: Nest[GraphInput]) -> Bound:
+  def concrete_bound(
+      self,
+      graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput],
+      env: Dict[jax.core.Var, LayerInput],
+      node: jax.core.Var,
+  ) -> jax_verify.IntervalBound:
     """Perform backward linear bound computation for the node `index`.
 
     Args:
-      node: Graph node to obtain a bound for.
       graph: Graph to perform Backward Propagation on.
+      inputs: Bounds on the inputs.
       env: Environment containing intermediate bound and shape information.
-      *bounds: Bounds on the inputs.
+      node: Graph node to obtain a bound for.
     Returns:
       concrete_bound: IntervalBound on the activation at `node`.
     """
@@ -277,17 +304,17 @@ class BackwardConcretizingAlgorithm(
   def __init__(self, backward_concretizer: BackwardConcretizer):
     self._backward_concretizer = backward_concretizer
 
-  def propagate(self,
-                graph: bound_propagation.PropagationGraph,
-                *bounds: Nest[GraphInput]
-                ) -> Tuple[Nest[LayerInput], Dict[jax.core.Var, LayerInput]]:
+  def propagate(
+      self,
+      graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput]
+  ) -> Tuple[Nest[LayerInput], Dict[jax.core.Var, LayerInput]]:
     subgraph_decider = self._backward_concretizer.should_handle_as_subgraph
     graph_inspector = GraphInspector(subgraph_decider)
     inspector_algorithm = bound_propagation.ForwardPropagationAlgorithm(
         graph_inspector)
-    gn_outvals, env = inspector_algorithm.propagate(graph, bounds)
+    gn_outvals, env = inspector_algorithm.propagate(graph, inputs)
 
-    flat_bounds, _ = jax.tree_util.tree_flatten(bounds)
     for node in graph_inspector.nodes.values():
       # Iterate over the nodes in order so that we get intermediate bounds in
       # the order where we need them.
@@ -302,9 +329,12 @@ class BackwardConcretizingAlgorithm(
             if isinstance(node_to_concretize, GraphNode):
               # This node has not yet been concretized. Perform concretization.
               concrete_bound = self._backward_concretizer.concrete_bound(
-                  jaxpr_node, graph, env, *flat_bounds)
+                  graph, inputs, env, jaxpr_node)
               env[jaxpr_node] = concrete_bound
 
+    # Fill in the bounds for the inputs.
+    for in_jaxpr_node, in_bound in zip(graph.inputs, inputs):
+      env[in_jaxpr_node] = in_bound
     # Iterate over the outputs, making sure to concretize all of them.
     outvals = []
     for gn in gn_outvals:
@@ -313,7 +343,7 @@ class BackwardConcretizingAlgorithm(
       # This node has not been concretized. Perform concretization.
       if isinstance(env_node, GraphNode):
         concrete_bound = self._backward_concretizer.concrete_bound(
-            jaxpr_node, graph, env, *flat_bounds)
+            graph, inputs, env, jaxpr_node)
         env[jaxpr_node] = concrete_bound
       else:
         concrete_bound = env_node
@@ -336,18 +366,17 @@ class BackwardAlgorithmForwardConcretization(
   def propagate(
       self,
       graph: bound_propagation.PropagationGraph,
-      *bounds: Nest[GraphInput],
+      inputs: Nest[GraphInput],
   ) -> Tuple[Nest[LayerInput], Dict[jax.core.Var, LayerInput]]:
     # Perform the forward propagation so that all intermediate bounds are
     # concretized.
-    _, env = self._forward_algorithm.propagate(graph, *bounds)
+    _, env = self._forward_algorithm.propagate(graph, inputs)
 
-    flat_bounds, _ = jax.tree_util.tree_flatten(bounds)
     # Iterate over the outputs, computing each one separately.
     outvals = []
     for out_var in graph.outputs:
       concrete_outvar_bound = self._backward_concretizer.concrete_bound(
-          out_var, graph, env, *flat_bounds)
+          graph, inputs, env, out_var)
       outvals.append(concrete_outvar_bound)
       env[out_var] = concrete_outvar_bound
     return outvals, env

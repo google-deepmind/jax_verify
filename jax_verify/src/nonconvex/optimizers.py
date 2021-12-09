@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@
 """
 
 import abc
-import math
-from typing import Tuple, Callable, Dict, Optional, List
+from typing import Tuple, Callable, Dict, Optional, List, Union
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +26,6 @@ from jax_verify.src import bound_propagation
 from jax_verify.src import ibp
 from jax_verify.src import utils
 from jax_verify.src.nonconvex import nonconvex
-import numpy as np
 import optax
 
 
@@ -82,24 +80,19 @@ class OptimizingConcretizer(nonconvex.Concretizer):
       self._branching_optimizer = branching_optimizer
       self._branching_opt_number_steps = branching_opt_number_steps
 
-  def accept_input(self, *_args, **_kwargs):
-    # There is no need to update anything.
-    pass
-
-  def accept_primitive(self, *_args, **_kwargs):
-    # For now, the optimizer is not dependent on what propagation has been
-    # achieved, so just reuse the same.
-    # Potentially, in the future, we could handle adapting the hyperparameters.
-    pass
+  def concrete_bound(
+      self,
+      graph: bound_propagation.PropagationGraph,
+      env: Dict[jax.core.Var, Union[bound_propagation.Bound, Tensor]],
+      nonconvex_bound: nonconvex.NonConvexBound) -> bound_propagation.Bound:
+    return self.get_bounds(nonconvex_bound)
 
   def get_bounds(self, to_opt_bound: nonconvex.NonConvexBound
                  ) -> bound_propagation.Bound:
     optimize_fun = self._optimizer.optimize_fun(to_opt_bound)
 
-    def optimize_chunk(chunk_index: int) -> Tuple[Tensor, Tensor]:
-      var_shapes, chunk_objectives = _create_opt_problems(
-          to_opt_bound, chunk_index, self._max_parallel_nodes)
-
+    def bound_fn(obj: Tensor) -> Tuple[Tensor, Tensor]:
+      var_shapes, chunk_objectives = _create_opt_problems(to_opt_bound, obj)
       ini_var_set = {key: 0.5 * jnp.ones(shape)
                      for key, shape in var_shapes.items()}
 
@@ -158,11 +151,10 @@ class OptimizingConcretizer(nonconvex.Concretizer):
             # Add the term corresponding to the dual variables to the linear
             # objective function.
             coeff_to_add = -side * branch_dvar
-            index_to_update = jax.ops.index[:, neuron_idx]
+            index_to_update = jnp.index_exp[:, neuron_idx]
             flat_node_obj = jnp.reshape(objectives[node_idx], (nb_targets, -1))
-            flat_updated_node_obj = jax.ops.index_add(flat_node_obj,
-                                                      index_to_update,
-                                                      coeff_to_add)
+            flat_updated_node_obj = flat_node_obj.at[index_to_update].add(
+                coeff_to_add)
             updated_node_obj = jnp.reshape(flat_updated_node_obj,
                                            var_shapes[node_idx])
             objectives[node_idx] = updated_node_obj
@@ -236,46 +228,13 @@ class OptimizingConcretizer(nonconvex.Concretizer):
       chunk_lbs, chunk_ubs = _unpack_opt_problem(bound_vals)
       return chunk_lbs, chunk_ubs
 
-    return _chunked_optimization(to_opt_bound.shape,
-                                 self._max_parallel_nodes,
-                                 optimize_chunk)
-
-
-def _chunked_optimization(
-    bound_shape: Tuple[int, ...],
-    max_parallel_nodes: int,
-    optimize_chunk: Callable[[int], Tuple[Tensor, Tensor]],
-) -> ibp.IntervalBound:
-  """Perform optimization of the target in chunks.
-
-  Args:
-    bound_shape: Shape of the bound to compute
-    max_parallel_nodes: How many activations to optimize at once. If =0, perform
-      optimize all the nodes simultaneously.
-    optimize_chunk: Function to optimize a chunk and return updated bounds.
-  Returns:
-    bounds: Optimized bounds.
-  """
-  nb_opt = int(np.prod(bound_shape))
-  if (max_parallel_nodes == 0) or (nb_opt <= max_parallel_nodes):
-    flat_lbs, flat_ubs = optimize_chunk(0)
-  else:
-    nb_opt_chunk = math.ceil(nb_opt / max_parallel_nodes)
-    chunk_indices = jnp.arange(nb_opt_chunk)
-    (map_lbs, map_ubs) = jax.lax.map(optimize_chunk, chunk_indices)
-    # Remove the padding elements
-    flat_lbs = jnp.reshape(map_lbs, (-1,))[:nb_opt]
-    flat_ubs = jnp.reshape(map_ubs, (-1,))[:nb_opt]
-  lbs = jnp.reshape(flat_lbs, bound_shape)
-  ubs = jnp.reshape(flat_ubs, bound_shape)
-  bounds = ibp.IntervalBound(lbs, ubs)
-  return bounds
+    return ibp.IntervalBound(*utils.chunked_bounds(
+        to_opt_bound.shape, self._max_parallel_nodes, bound_fn))
 
 
 def _create_opt_problems(
     non_convex_bound: nonconvex.NonConvexBound,
-    chunk_index: int,
-    nb_parallel_nodes: int,
+    obj: Tensor,
 ) -> Tuple[Dict[Index, Tuple[int, ...]], ParamSet]:
   """Define the objective function and the necessary variables shape.
 
@@ -283,20 +242,17 @@ def _create_opt_problems(
 
   Args:
     non_convex_bound: Bound for which to create the optimization problems.
-    chunk_index: Index of the optimization chunk to generate.
-    nb_parallel_nodes: How large should the optimization chunks be. If 0,
-      optimize all problems at once.
+    obj: One-hot tensor of shape (nb_parallel_nodes, *obj_shape) specifying
+      the elements of the objective to optimise.
   Returns:
     var_to_opt: shapes of the variables to optimize to compute the bounds.
     objectives_by_layer: Objectives to minimize, in the form of a dictionary
       mapping the position of activations to the linear coefficients of the
       objective function.
   """
-  # Create the objective matrix
-  lb_obj = utils.objective_chunk(
-      non_convex_bound.shape, chunk_index, nb_parallel_nodes)
   # Get the objective for the upper bounds.
-  ub_obj = -lb_obj
+  lb_obj = obj
+  ub_obj = -obj
   obj = jnp.concatenate([lb_obj, ub_obj], axis=0)
 
   # Generate the shape of the variables necessary to solve the problem
@@ -594,4 +550,3 @@ class PGDOptimizer(BoundOptimizer):
       return var_set
 
     return optimize
-

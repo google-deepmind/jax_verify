@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import functools
 from absl.testing import absltest
 from absl.testing import parameterized
 
+import chex
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -100,7 +101,7 @@ class BoundPropagationTest(parameterized.TestCase):
     z = jnp.array([[1., 2., 3.]])
 
     fun = hk.without_apply_rng(
-        hk.transform(residual_model_all_act, apply_rng=True))
+        hk.transform(residual_model_all_act))
     params = fun.init(jax.random.PRNGKey(1), z)
     input_bounds = jax_verify.IntervalBound(z - 1.0, z + 1.0)
     fun_to_prop = functools.partial(fun.apply, params)
@@ -165,6 +166,30 @@ class BoundPropagationTest(parameterized.TestCase):
     ]:
       output_bounds = boundprop_method(fun_to_prop, input_bounds)
       _check_matching_structures(model_output, output_bounds)
+
+  def test_jittable_input_bounds(self):
+    model = sequential_model
+    z = jnp.array([[1., 2., 3.]])
+    params = model.init(jax.random.PRNGKey(1), z)
+    fun_to_prop = functools.partial(model.apply, params)
+
+    non_jittable_bounds = jax_verify.IntervalBound(z - 1.0, z + 1.0)
+    jittable_input_bounds = non_jittable_bounds.to_jittable()
+
+    @jax.jit
+    def bound_prop_fun(inp_bound):
+      bounds = jax_verify.interval_bound_propagation(fun_to_prop, inp_bound)
+      return bounds.lower, bounds.upper
+
+    # check that we can jit the bound prop and pass in jittable bounds.
+    out_lb, out_ub = bound_prop_fun(jittable_input_bounds)
+    self.assertTrue(all(out_ub >= out_lb))
+
+    # Check that this gives the same result as without the jit
+    bounds = jax_verify.interval_bound_propagation(fun_to_prop,
+                                                   non_jittable_bounds)
+    chex.assert_trees_all_close(out_lb, bounds.lower)
+    chex.assert_trees_all_close(out_ub, bounds.upper)
 
 
 class StaticArgumentModel(hk.Module):

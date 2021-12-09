@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import jax.numpy as jnp
+from jax_verify.extensions.sdp_verify import utils
 from jax_verify.src import bound_propagation
 from jax_verify.src import synthetic_primitives
-from jax_verify.src.sdp_verify import utils
 import numpy as np
 
 
@@ -198,7 +198,6 @@ class SdpNode(Bound):
       dual_vars: Dual variables for this node.
       x: Primal value for this activation (or input).
       ys: Primal values for all pre-activations.
-
     Dual variables correspond to:
     lam: ReLU quadratic constraint: z^2 = z*(Wx)
     nu: IBP quadratic constraint: x^2 <= (l+u)*x - l*u
@@ -264,4 +263,3 @@ class _SdpTransform(bound_propagation.GraphTransform[SdpNode]):
         xs = [ys[arg.index] if isinstance(arg, Bound) else arg for arg in args]
         ys[context.index] = primitive.bind(*xs, **params)
       return SdpNode(context.index, bound, False, None, forward_propagate)
-

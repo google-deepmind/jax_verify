@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -105,6 +105,28 @@ class ModelZooModelTests(parameterized.TestCase):
       ('SmallResidualModel', model_zoo.SmallResidualModel),
       ('TinyModel', model_zoo.TinyModel)
   )
+  def test_backward_crown(self, model_cls):
+
+    @hk.transform_with_state
+    def model_pred(inputs, is_training, test_local_stats=False):
+      model = model_cls()
+      return model(inputs, is_training, test_local_stats)
+
+    inps = jnp.zeros((4, 28, 28, 1), dtype=jnp.float32)
+    params, state = model_pred.init(jax.random.PRNGKey(42), inps,
+                                    is_training=True)
+
+    def logits_fun(inputs):
+      return model_pred.apply(params, state, None, inputs,
+                              False, test_local_stats=False)[0]
+
+    input_bounds = jax_verify.IntervalBound(inps - 1.0, inps + 1.0)
+    jax_verify.backward_crown_bound_propagation(logits_fun, input_bounds)
+
+  @parameterized.named_parameters(
+      ('SmallResidualModel', model_zoo.SmallResidualModel),
+      ('TinyModel', model_zoo.TinyModel)
+  )
   def test_crownibp(self, model_cls):
 
     @hk.transform_with_state
@@ -176,7 +198,7 @@ class ModelZooModelTests(parameterized.TestCase):
         logits_fun, input_bounds)
 
     objective_bias = 0.
-    objective = jax.ops.index_update(jnp.zeros(output.shape[1:]), 0, 1)
+    objective = jnp.zeros(output.shape[1:]).at[0].set(1)
     index = 0
 
     lower_bound, _, _ = relaxation.solve_relaxation(

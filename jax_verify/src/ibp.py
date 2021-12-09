@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -450,6 +450,7 @@ _primitives_to_passthrough = bound_propagation.RESHAPE_PRIMITIVES + [
     lax.log_p,
     synthetic_primitives.softplus_p,
     synthetic_primitives.relu_p,
+    synthetic_primitives.sigmoid_p,
     lax.sqrt_p,
     lax.sign_p,
 ]

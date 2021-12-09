@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,8 +31,8 @@ from absl import flags
 from absl import logging
 import jax.numpy as jnp
 import jax_verify
+from jax_verify.extensions.sdp_verify import utils
 from jax_verify.src.linear import forward_linear_bounds
-from jax_verify.src.sdp_verify import utils
 import numpy as np
 
 MLP_PATH = 'models/raghunathan18_pgdnn.pkl'

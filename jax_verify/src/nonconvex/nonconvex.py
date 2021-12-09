@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,9 +37,7 @@ import jax.numpy as jnp
 from jax_verify.src import activation_relaxation
 from jax_verify.src import bound_propagation
 from jax_verify.src import graph_traversal
-from jax_verify.src import ibp
 from jax_verify.src import intersection
-from jax_verify.src import mccormick
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
 
@@ -47,11 +45,14 @@ NnCvx = TypeVar('NnCvx', bound='NonConvexBound')
 Tensor = jnp.ndarray
 Index = bound_propagation.Index
 TransformContext = bound_propagation.TransformContext
+Bound = bound_propagation.Bound
+BoundTransform = bound_propagation.BoundTransform
 # Mapping of a position in the computation to a set of parameters.
 # These can be variables, gradients, or coefficients.
 ParamSet = Dict[Index, Tensor]
 PrimitiveInput = Union[Tensor, 'NonConvexBound']
 Nest = bound_propagation.Nest
+TensorFunction = Callable[..., Tensor]
 
 
 def _sum_fn(fn, *args, **kwargs):
@@ -92,7 +93,7 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
   Important bits of machinery shared by all subclasses:
   - _eval_fn is a function that takes as inputs tensors as specified by
     `variables` and evaluate the activations.
-  - concretizer is an instance of `Concretizer`, that exposes a `get_bounds`
+  - concretizer is an instance of `Concretizer`, that exposes a `concrete_bound`
     method. This is used during the bound propagation when concrete bounds are
     required (such as when defining the convex hull relaxation of a ReLU.).
     The choice of concretizer impacts of those intermediate concrete bounds are
@@ -318,8 +319,8 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
     _, dual_vars = primal_gradfun_wrt_act(acts, objectives)
     return dual_vars, acts
 
-  def concretize(self, concretizer: 'Concretizer'):
-    self._concretized_bounds = concretizer.get_bounds(self)
+  def concretize(self, concretizer: 'Concretizer', graph, env):
+    self._concretized_bounds = concretizer.concrete_bound(graph, env, self)
 
   @classmethod
   def initial_nonconvex_bound(
@@ -341,9 +342,9 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
 
     bound_ctor = cls.get_initial_bound_constructor(index, lb, ub)
 
-    return bound_ctor(index, shape, previous_bounds,
-                      eval_fn, variables, ibp.IntervalBound(lower_bound,
-                                                            upper_bound))
+    return bound_ctor(
+        index, shape, previous_bounds, eval_fn, variables,
+        bound_propagation.IntervalBound(lower_bound, upper_bound))
 
 
 class ConstrainedNonConvexBound(NonConvexBound, metaclass=abc.ABCMeta):
@@ -351,7 +352,7 @@ class ConstrainedNonConvexBound(NonConvexBound, metaclass=abc.ABCMeta):
 
   The assumption is that, before any evaluation of the primal or dual, the
   `set_imposed_bounds` function is called. As a result, these should be
-  created through a `ConstrainedNonConvexTransform`
+  created through a `_ConstrainedNonConvexTransform`
 
   * `lower` and `upper` return those by default before being concretized.
   * Concretizing will result in the concretized bounds being the tightest
@@ -374,6 +375,11 @@ class ConstrainedNonConvexBound(NonConvexBound, metaclass=abc.ABCMeta):
 
   def is_constrained(self) -> bool:
     return self._imposed_bounds is not None
+
+  def imposed_bounds(self) -> bound_propagation.Bound:
+    if self._imposed_bounds is None:
+      raise ValueError('No imposed bounds')
+    return self._imposed_bounds
 
   def set_imposed_bounds(self, imposed_bounds: bound_propagation.Bound):
     self._imposed_bounds = imposed_bounds
@@ -416,8 +422,8 @@ class ConstrainedNonConvexBound(NonConvexBound, metaclass=abc.ABCMeta):
       return self._imposed_bounds.upper
     return super().upper
 
-  def concretize(self, concretizer: 'Concretizer'):
-    super().concretize(concretizer)
+  def concretize(self, concretizer: 'Concretizer', graph, env):
+    super().concretize(concretizer, graph, env)
     if self._imposed_bounds is not None:
       # Ensure that the concretized bounds respect the imposed bounds.
       self._concretized_bound = intersection.IntersectionBound(
@@ -432,61 +438,27 @@ class Concretizer(abc.ABC):
   """
 
   @abc.abstractmethod
-  def accept_input(
+  def concrete_bound(
       self,
-      context: TransformContext,
-      lower_bound: Tensor, upper_bound: Tensor):
-    """Update the concretizer based on the initial input bound."""
-
-  @abc.abstractmethod
-  def accept_primitive(
-      self,
-      context: TransformContext,
-      primitive: bound_propagation.Primitive,
-      *in_vals: PrimitiveInput,
-      **params):
-    """Update the concretizer based on the resulting bound."""
-
-  @abc.abstractmethod
-  def get_bounds(
-      self, nonconvex_bound: NonConvexBound) -> bound_propagation.Bound:
-    """Return a concretized bound."""
+      graph: bound_propagation.PropagationGraph,
+      env: Dict[jax.core.Var, Union[Bound, Tensor]],
+      nonconvex_bound: NonConvexBound) -> Bound:
+    """Returns a concretized bound."""
 
 
 class BaseBoundConcretizer(Concretizer):
   """Concretizer based on performing a parallel propagation with another method.
 
-  This should be initialized with the `input_transform` and the
-  `primitive_transform` that are usually passed to `bound_propagation`.
+  This should be constructed with an environment resulting from forward
+  propagation of another bound propagation method.
   """
 
-  def __init__(self, bound_transform: bound_propagation.BoundTransform):
-    self._bound_transform = bound_transform
-    self._base_bounds = {}
-
-  def accept_input(
+  def concrete_bound(
       self,
-      context: TransformContext,
-      lower_bound: Tensor, upper_bound: Tensor):
-    self._base_bounds[context.index] = self._bound_transform.input_transform(
-        context, lower_bound, upper_bound)
-
-  def accept_primitive(
-      self,
-      context: TransformContext,
-      primitive: bound_propagation.Primitive,
-      *in_vals: PrimitiveInput,
-      **params):
-    base_in_vals = [
-        self._base_bounds[inp.index] if isinstance(inp, NonConvexBound) else inp
-        for inp in in_vals]
-    self._base_bounds[context.index] = (
-        self._bound_transform.equation_transform(
-            context, primitive, *base_in_vals, **params))
-
-  def get_bounds(self, nonconvex_bound: NonConvexBound
-                 ) -> bound_propagation.Bound:
-    return self._base_bounds[nonconvex_bound.index]
+      graph: bound_propagation.PropagationGraph,
+      env: Dict[jax.core.Var, Union[Bound, Tensor]],
+      nonconvex_bound: NonConvexBound) -> Bound:
+    return env[graph.jaxpr_node(nonconvex_bound.index)]
 
 
 def eval_if_nonconvexbound(inp: Union[NonConvexBound, Tensor],
@@ -587,76 +559,6 @@ def _nonconvex_div(bound_cls: Type[NnCvx],
   return _nonconvex_linear_op(lax.mul_p, bound_cls, index, lhs, 1. / rhs)
 
 
-def _nonconvex_softplus(bound_cls: Type[NnCvx],
-                        index: Index,
-                        inp: NnCvx) -> NnCvx:
-  """Propagation of NonConvex bounds through a Softplus.
-
-  Args:
-    bound_cls: Bound class to use.
-    index: Index of the computation.
-    inp: Input to the softplus
-  Returns:
-    out_bounds: nonconvex bounds on the operation's output
-  """
-  # Get the input bounds necessary for the relaxation
-  inp_lb = inp.lower
-  inp_ub = inp.upper
-
-  out_lb = jax.nn.softplus(inp_lb)
-  out_ub = jax.nn.softplus(inp_ub)
-
-  slope = (out_ub - out_lb) / jnp.maximum(inp_ub - inp_lb, 1e-12)
-  offset = out_lb - slope * inp_lb
-  broad_slope = jnp.expand_dims(slope, 0)
-  broad_offset = jnp.expand_dims(offset, 0)
-
-  # Define the lower and upper bound functions
-  lb_fun = jax.nn.softplus
-  ub_fun = lambda x: broad_slope * x + broad_offset
-
-  return _activation_convex_relaxation(
-      bound_cls, index, [inp], 'Softplus', lb_fun, ub_fun,
-      ibp.IntervalBound(jax.nn.softplus(inp_lb), jax.nn.softplus(inp_ub)))
-
-
-def _nonconvex_relu(bound_cls: Type[NnCvx],
-                    index: Index,
-                    inp: NnCvx) -> NnCvx:
-  """Propagation of NonConvex bounds through a max.
-
-  Args:
-    bound_cls: Bound class to use.
-    index: Index of the computation.
-    inp: Input to the ReLU.
-  Returns:
-    out_bounds: nonconvex bounds on the operation's output
-  """
-  # Get the input bounds necessary for the relaxation
-  inp_lb = inp.lower
-  inp_ub = inp.upper
-
-  # Get the upper bound
-  relu_on = (inp_lb >= 0.)
-  relu_amb = jnp.logical_and(inp_lb < 0., inp_ub >= 0.)
-  slope = relu_on.astype(jnp.float32)
-  slope += jnp.where(relu_amb,
-                     inp_ub / jnp.maximum(inp_ub - inp_lb, 1e-12),
-                     jnp.zeros_like(inp_lb))
-  offset = jnp.where(relu_amb, -slope * inp_lb,
-                     jnp.zeros_like(inp_lb))
-  broad_slope = jnp.expand_dims(slope, 0)
-  broad_offset = jnp.expand_dims(offset, 0)
-
-  # Define the lower and upper bound functions
-  lb_fun = lambda x: lax.max(x, 0.)
-  ub_fun = lambda x: broad_slope * x + broad_offset
-
-  return _activation_convex_relaxation(
-      bound_cls, index, [inp], 'ReLU', lb_fun, ub_fun,
-      ibp.IntervalBound(lax.max(inp_lb, 0.), lax.max(inp_ub, 0.)))
-
-
 def _activation_convex_relaxation(
     bound_cls: Type[NnCvx],
     index: Index,
@@ -710,211 +612,69 @@ def _activation_convex_relaxation(
                         eval_fn, variables, precomputed_bound)
 
 
-def _nonconvex_dotproductattention(
+def _nonconvex_activation(
+    act_type: str,
+    relaxation: Callable[..., Tuple[TensorFunction, TensorFunction]],
     bound_cls: Type[NnCvx],
     index: Index,
-    inp: NnCvx,
-    weights_query: Tuple[Tensor, Tensor],
-    weights_key: Tuple[Tensor, Tensor],
-) -> NnCvx:
-  """Builds the NonConvexBound object corresponding to dot product.
+    *inps: Union[NnCvx, Tensor],
+    increasing: bool = False,
+    **params) -> NnCvx:
+  """Propagation of NonConvexBounds through a non-linear operation.
 
-  The weights are in the form: [num_heads, emb_dim, inp_dim]
-  The bias are in the form: [num_heads, emb_dim]
-  Bounds on the inputs are [batch_size, num_words, inp_dim]
-
-  When evaluating the bounds, there will be an additional target dimension, so
-    Inputs should evaluate to [nb_targets, batch_size, num_words, inp_dim]
-    Output is going to be [nb_targets, batch_size,
-                           num_heads, num_words, num_words]
-
-  Compute bounds on (inp @ wq + bq)' @ (inp @ wk + bk).
   Args:
+    act_type: Activation type, e.g. 'Softplus' or 'ReLU'.
+    relaxation: Function accepting (*inps, **params) and returning
+      convex lower bound and concave upper bound functions.
     bound_cls: Bound class to use.
-    index: Index of input.
-    inp: Input of the non-linearity.
-    weights_query: Query weights (wq, bq)
-    weights_key: Key weights (wk, bk)
+    index: Node index.
+    *inps: Nonconvex bounds on the inputs to the operation.
+    increasing: Whether the operation is known to be monotonic increasing,
+      in which case we can pre-compute its bounds.
+    **params: Parameters of the operation.
   Returns:
-    out_bounds: NonConvexBound for the output of the non-linearity
+    out_bounds: Nonconvex bounds on the operation's output.
   """
-  # Get the input bounds necessary for the relaxation
-  inp_lb = inp.lower
-  inp_ub = inp.upper
-  wq, bq = weights_query
-  wk, bk = weights_key
-  assert wq.shape[-1] == inp_lb.shape[-1]
-  assert wk.shape[-1] == inp_lb.shape[-1]
-  assert len(wq.shape) == 3
-  assert len(wk.shape) == 3
+  lb_fun, ub_fun = relaxation(*inps, **params)
 
-  inp_dim = wq.shape[2]
-
-  # We are going to define the function at the scalar level, and progressively
-  # add batching dimensions.
-
-  # In order to avoid materializing too large of a matrix, we are going to
-  # iterate over the "feature-to-feature" matching of the inputs which
-  # gets summed over. We use a scan loop to accumulate the contribution,
-  # assuming that we're computing it *from one word to another word*
-
-  # Here, attention matrix is [inp_dim, inp_dim],
-  # and all others inputs are vector of size [inp_dim]
-  # Output is a tuple of scalars
-  def word_pair_attention(attention_matrix, lb_a, ub_a, x_a, lb_b, ub_b, x_b):
-
-    def accumulate_attention_by_inputfeat(carry, cross_inp_indx):
-      feat_x, feat_y = jnp.divmod(cross_inp_indx, inp_dim)
-      att_mat_elt = attention_matrix[feat_x, feat_y]
-      pos_att_mat_elt = jnp.maximum(att_mat_elt, 0.)
-      neg_att_mat_elt = jnp.minimum(att_mat_elt, 0.)
-
-      x_a_feat = x_a[feat_x]
-      lb_a_feat = lb_a[feat_x]
-      ub_a_feat = ub_a[feat_x]
-
-      x_b_feat = x_b[feat_y]
-      lb_b_feat = lb_b[feat_y]
-      ub_b_feat = ub_b[feat_y]
-
-      (mc_l, mc_u) = mccormick.mccormick_outer_product(
-          x_a_feat, x_b_feat,
-          lb_a_feat, ub_a_feat,
-          lb_b_feat, ub_b_feat)
-      mc_l = mc_l.squeeze()
-      mc_u = mc_u.squeeze()
-      (carry_l, carry_u) = carry
-
-      new_carry = (carry_l + pos_att_mat_elt * mc_l + neg_att_mat_elt * mc_u,
-                   carry_u + neg_att_mat_elt * mc_l + pos_att_mat_elt * mc_u)
-      return new_carry, None
-
-    inp_cross_indxs = jnp.arange(inp_dim**2)
-    ini_attention = (jnp.array(0.), jnp.array(0.))
-    attention, _ = jax.lax.scan(accumulate_attention_by_inputfeat,
-                                ini_attention, inp_cross_indxs)
-    return attention
-
-  # We are now going to vmap over the words dimension for
-  #  - the inputs on the left (lb_a, ub_a, x_a)
-  #  - the inputs on the right (lb_b, ub_b, x_b)
-  # Attention_matrix is not batched over, and each of the inputs ignore the
-  # batching of the other input.
-  # You can think of these two batching as:
-  #   * First, going from a function computing the attention score for a pair
-  #     of words to a function computing attention scores from one word to all
-  #     other words.
-  #   * Second, from that function to a function computing attention score from
-  #     all words to all other words.
-  # The args are:
-  #   - attention_matrix is [inp_dim, inp_dim]
-  #   - all other inputs are now [nb_words, inp_dim]
-  # Outputs is a tuple of shape (nb_words, nb_words)
-  all_words_attention = jax.vmap(jax.vmap(word_pair_attention,
-                                          in_axes=(None,) + (0,)*3 + (None,)*3,
-                                          out_axes=0),
-                                 in_axes=(None,) + (None,)*3 + (0,)*3,
-                                 out_axes=0)
-
-  # We are now going to compute the actual attention score, not just the
-  # quadratic part.
-  # Note that we use the previously defined function duplicating the arguments.
-  # We also add the linear and constant terms.
-  # All computations are done for a single head.
-  #   wq, wk are [emb_dim, inp_dim]
-  #   bq, bq are [emb_dim]
-  #   x_lb, x_ub, x are [nb_words, inp_dim]
-  # Outputs is a tuple of shape (nb_words, nb_words)
-  def per_head_attention(wq, bq, wk, bk, x_lb, x_ub, x):
-    attention_matrix = jnp.dot(wq.T, wk)
-    # attention_matrix is [inp_dim, inp_dim]
-
-    wq_bk = jnp.dot(wq.T, bk)
-    wk_bq = jnp.dot(wk.T, bq)
-    # These are [inp_dim] vectors
-
-    bk_bq = jnp.dot(bq.T, bk)
-    # bk_bq is a scalar.
-
-    quad_term_lower, quad_term_upper = all_words_attention(attention_matrix,
-                                                           x_lb, x_ub, x,
-                                                           x_lb, x_ub, x)
-
-    # Each of the component of the linear term is a [nb_words] vector.
-    lin_term = (jnp.expand_dims(jnp.dot(x, wq_bk), 0)
-                + jnp.expand_dims(jnp.dot(x, wk_bq), 1))
-    # This is a scalar.
-    constant_term = bk_bq
-
-    return (quad_term_lower + lin_term + constant_term,
-            quad_term_upper + lin_term + constant_term)
-
-  # We add a batching dimension that corresponds to each head of the self
-  # attention for all the weights and biases.
-  #   wq, wk are [num_heads, emb_dim, inp_dim]
-  #   bq, bk are [num_heads, emb_dim]
-  #   x_lb, x_ub, x are [nb_words, inp_dim]
-  # Outputs is a tuple of shape (num_heads, nb_words, nb_words)
-  all_words_all_heads_attention = jax.vmap(per_head_attention,
-                                           in_axes=(0,)*4 + (None, None, None),
-                                           out_axes=0)
-
-  # We add the batch dimension over the samples, to x and the bounds.
-  #   wq, wk are [num_heads, emb_dim, inp_dim]
-  #   bq, bk are [num_heads, emb_dim]
-  #   x_lb, x_ub, x are [batch_idx, nb_words, inp_dim]
-  # Outputs is a tuple of shape (batch_idx, num_heads, nb_words, nb_words)
-  batched_awah_attention = jax.vmap(all_words_all_heads_attention,
-                                    in_axes=(None,)*4 + (0,)*3,
-                                    out_axes=0)
-
-  # We add a target dimension for the different optimization targets, only on x.
-  #   wq, wk are [num_heads, emb_dim, inp_dim]
-  #   bq, bk are [num_heads, emb_dim]
-  #   x_lb, x_ub are [batch_idx, nb_words, inp_dim]
-  #   x is [target_idx, batch_idx, nb_words, inp_dim]
-  # Outputs is a tuple of shape (target_idx, batch_idx,
-  #                              num_heads, nb_words, nb_words)
-  batched_per_target_awah_attention = jax.vmap(batched_awah_attention,
-                                               in_axes=(None,)*6 + (0,),
-                                               out_axes=0)
-
-  # We fold in all the arguments that are parameters or input bounds, so as to
-  # just get the function evaluating the bounds.
-  folded_arguments = functools.partial(batched_per_target_awah_attention,
-                                       wq, bq, wk, bk, inp_lb, inp_ub)
-
-  lb_fun = lambda x: jnp.transpose(folded_arguments(x)[0], (0, 1, 2, 4, 3))
-  ub_fun = lambda x: jnp.transpose(folded_arguments(x)[1], (0, 1, 2, 4, 3))
-
-  return _activation_convex_relaxation(
-      bound_cls, index, [inp], 'DotProductSA', lb_fun, ub_fun,
-      None)
-
-
-def _nonconvex_posbilinear(bound_cls, index, inp_a, inp_b, **params):
-  """Builds the NonConvexBound object corresponding to dot product.
-
-  Compute bounds on inp_a @ inp_b
-  Args:
-    bound_cls: Bound class to use.
-    index: Index of output.
-    inp_a: Argument of matrix product
-    inp_b: Argument of matrix product
-    **params: Parameters of the matrix product.
-  Returns:
-    out_bounds: NonConvexBound for the output of the non-linearity
-  """
-  lb_fun, ub_fun = activation_relaxation.posbilinear_relaxation(
-      inp_a.lower, inp_a.upper, inp_b.lower, inp_b.upper,
-      **params)
+  if increasing:
+    # The function is assumed to be monotonically increasing, so we
+    # can readily pre-compute interval bounds on its output.
+    # `lb_fun` will be the original function whenever this is reached.
+    precomputed_bound = bound_propagation.IntervalBound(
+        lb_fun(*[inp.lower for inp in inps]),
+        lb_fun(*[inp.upper for inp in inps]))
+  else:
+    precomputed_bound = None
 
   lb_fun = jax.vmap(lb_fun, in_axes=0, out_axes=0)
   ub_fun = jax.vmap(ub_fun, in_axes=0, out_axes=0)
 
   return _activation_convex_relaxation(
-      bound_cls, index, [inp_a, inp_b], 'BilinearValues', lb_fun, ub_fun,
-      None)
+      bound_cls, index,
+      [inp for inp in inps if isinstance(inp, NonConvexBound)],
+      act_type, lb_fun, ub_fun, precomputed_bound)
+
+
+_nonconvex_softplus = functools.partial(
+    _nonconvex_activation,
+    'Softplus', functools.partial(
+        activation_relaxation.convex_fn_relaxation,
+        synthetic_primitives.softplus_p),
+    increasing=True)
+
+
+_nonconvex_relu = functools.partial(
+    _nonconvex_activation,
+    'ReLU', functools.partial(
+        activation_relaxation.convex_fn_relaxation,
+        synthetic_primitives.relu_p),
+    increasing=True)
+
+
+_nonconvex_posbilinear = functools.partial(
+    _nonconvex_activation,
+    'BilinearValues', activation_relaxation.posbilinear_relaxation)
 
 
 _linear_op_primitives = (
@@ -932,50 +692,21 @@ _nonconvex_primitive_transform.update({
 })
 
 
-def build_nonconvex_formulation(
-    bound_cls: Type[NnCvx],
-    concretizer_ctor: Callable[[], Concretizer],
-    function: Callable[..., Nest[Tensor]],
-    *bounds: List[graph_traversal.GraphInput],
-    graph_simplifier=synthetic_primitives.default_simplifier
-    ) -> Nest[NnCvx]:
-  """Builds the optimizable objective.
-
-  Args:
-    bound_cls: Bound class to use. This determines what dual formulation will
-      be computed.
-    concretizer_ctor: Constructor for the concretizer to use to obtain
-      intermediate bounds.
-    function: Function performing computation to obtain bounds for. Takes as
-      only arguments the network inputs.
-    *bounds: Bounds on the inputs of the function.
-    graph_simplifier: What graph simplifier to use.
-  Returns:
-    output_bounds: NonConvex bounds that can be optimized with a solver.
-  """
-  concretizer = concretizer_ctor()
-  bound_transform = NonConvexTransform(bound_cls, concretizer)
-  output_bounds, _ = bound_propagation.bound_propagation(
-      bound_propagation.ForwardPropagationAlgorithm(bound_transform),
-      function, *bounds, graph_simplifier=graph_simplifier)
-  # Always concretize the returned bounds so that `lower` and `upper` are
-  # accessible
-  for out_bound in jax.tree_util.tree_leaves(output_bounds):
-    if out_bound.requires_concretizing(None):
-      out_bound.concretize(concretizer)
-
-  return output_bounds
-
-
-class NonConvexTransform(Generic[NnCvx],
-                         bound_propagation.GraphTransform[NnCvx]):
+class _NonConvexTransform(
+    Generic[NnCvx], bound_propagation.GraphTransform[NnCvx]):
   """Graph Transform to build a NonConvex Relaxation, which can be optimized."""
 
-  def __init__(self,
-               bound_cls: Type[NnCvx],
-               concretizer: Concretizer):
+  def __init__(
+      self,
+      bound_cls: Type[NnCvx],
+      concretizer: Concretizer,
+      graph: bound_propagation.PropagationGraph,
+      env: Dict[jax.core.Var, Union[Bound, Tensor]],
+  ):
     self._bound_cls = bound_cls
     self._concretizer = concretizer
+    self._graph = graph
+    self._env = env
 
   def input_transform(
       self,
@@ -983,7 +714,6 @@ class NonConvexTransform(Generic[NnCvx],
       lower_bound: Tensor,
       upper_bound: Tensor,
   ) -> NnCvx:
-    self._concretizer.accept_input(context, lower_bound, upper_bound)
     return self._bound_cls.initial_nonconvex_bound(
         context.index, lower_bound, upper_bound)
 
@@ -994,32 +724,30 @@ class NonConvexTransform(Generic[NnCvx],
       *args: PrimitiveInput,
       **params,
   ) -> NnCvx:
-    self._concretizer.accept_primitive(context, primitive, *args, **params)
     for arg in args:
       if (isinstance(arg, NonConvexBound) and
           arg.requires_concretizing(primitive)):
-        arg.concretize(self._concretizer)
+        arg.concretize(self._concretizer, self._graph, self._env)
     params = utils.filter_jaxverify_kwargs(params)
     new_bound = _nonconvex_primitive_transform[primitive](
         self._bound_cls, context.index, *args, **params)
     return new_bound
 
 
-class ConstrainedNonConvexTransform(
-    NonConvexTransform[ConstrainedNonConvexBound]):
+class _ConstrainedNonConvexTransform(
+    _NonConvexTransform[ConstrainedNonConvexBound]):
   """Graph Transform performing parallel boundprop and imposing bounds."""
 
-  def __init__(self,
-               bound_cls: Type[ConstrainedNonConvexBound],
-               concretizer: Concretizer,
-               imposed_boundprop: bound_propagation.BoundTransform):
-    super().__init__(bound_cls, concretizer)
-    self._imposed_concretizer = BaseBoundConcretizer(imposed_boundprop)
-
-  def _impose_bounds(self, unc_bound: ConstrainedNonConvexBound):
-    """Set imposed bounds, as obtained from the imposed_boundprop."""
-    bounds_to_impose = self._imposed_concretizer.get_bounds(unc_bound)
-    unc_bound.set_imposed_bounds(bounds_to_impose)
+  def __init__(
+      self,
+      bound_cls: Type[ConstrainedNonConvexBound],
+      imposed_boundprop: BoundTransform,
+      concretizer: Concretizer,
+      graph: bound_propagation.PropagationGraph,
+      env: Dict[jax.core.Var, Union[Bound, Tensor]],
+  ):
+    super().__init__(bound_cls, concretizer, graph, env)
+    self._imposed_boundprop = imposed_boundprop
 
   def input_transform(
       self,
@@ -1027,20 +755,93 @@ class ConstrainedNonConvexTransform(
       lower_bound: Tensor,
       upper_bound: Tensor,
   ) -> ConstrainedNonConvexBound:
-    self._imposed_concretizer.accept_input(context, lower_bound, upper_bound)
     bound = super().input_transform(context, lower_bound, upper_bound)
-    self._impose_bounds(bound)
+    bound.set_imposed_bounds(self._imposed_boundprop.input_transform(
+        context, lower_bound, upper_bound))
     return bound
 
   def primitive_transform(
       self,
       context: TransformContext,
       primitive: bound_propagation.Primitive,
-      *args: PrimitiveInput,
+      *args: Union[ConstrainedNonConvexBound, Tensor],
       **params,
   ) -> ConstrainedNonConvexBound:
-    self._imposed_concretizer.accept_primitive(context, primitive,
-                                               *args, **params)
     bound = super().primitive_transform(context, primitive, *args, **params)
-    self._impose_bounds(bound)
+    imposed_bound_args = [
+        arg.imposed_bounds() if isinstance(arg, Bound) else arg
+        for arg in args]
+    bound.set_imposed_bounds(self._imposed_boundprop.equation_transform(
+        context, primitive, *imposed_bound_args, **params))
     return bound
+
+
+class NonConvexAlgorithm(
+    Generic[NnCvx], bound_propagation.PropagationAlgorithm[NnCvx]):
+  """Forward algorithm with an optional initial pass for 'base' bounds."""
+
+  def __init__(
+      self,
+      nonconvex_transform_ctor: Callable[..., BoundTransform],
+      concretizer: Concretizer,
+      base_boundprop: Optional[BoundTransform] = None):
+    super().__init__()
+    self._nonconvex_transform_ctor = nonconvex_transform_ctor
+    self._concretizer = concretizer
+    self._base_boundprop = base_boundprop
+
+  def propagate(
+      self,
+      graph: bound_propagation.PropagationGraph,
+      bounds: Nest[graph_traversal.GraphInput],
+  ) -> Tuple[Nest[Bound], Dict[jax.core.Var, Union[Bound, Tensor]]]:
+    if self._base_boundprop is not None:
+      # Propagate the 'base' bounds in advance, for subsequent use by
+      # the concretiser.
+      _, base_env = bound_propagation.ForwardPropagationAlgorithm(
+          self._base_boundprop).propagate(graph, bounds)
+    else:
+      # No 'base' boundprop method specified.
+      # This is fine as long as the concretiser does not rely on base bounds.
+      base_env = None
+
+    nonconvex_transform = self._nonconvex_transform_ctor(
+        self._concretizer, graph, base_env)
+    output_bounds, env = bound_propagation.ForwardPropagationAlgorithm(
+        nonconvex_transform).propagate(graph, bounds)
+
+    # Always concretize the returned bounds so that `lower` and `upper` are
+    # accessible
+    for out_bound in jax.tree_util.tree_leaves(output_bounds):
+      if out_bound.requires_concretizing(None):
+        out_bound.concretize(self._concretizer, graph, base_env)
+
+    return output_bounds, env
+
+
+def nonconvex_algorithm(
+    bound_cls: Type[NnCvx],
+    concretizer: Concretizer,
+    *,
+    base_boundprop: Optional[BoundTransform] = None,
+    imposed_boundprop: Optional[BoundTransform] = None,
+) -> bound_propagation.PropagationAlgorithm[NnCvx]:
+  """Builds a bound propagation algorithm for the non-convex formulation.
+
+  Args:
+    bound_cls: Bound class to use. This determines what dual formulation will
+      be computed.
+    concretizer: Concretizer to use to obtain intermediate bounds.
+    base_boundprop: Underlying bound propagation method for obtaining concrete
+      bounds.
+    imposed_boundprop: Additional bounds to apply as constraints, e.g. from
+      a branching decision.
+  Returns:
+    Propagation algorithm.
+  """
+  if imposed_boundprop is None:
+    bound_transform_ctor = functools.partial(_NonConvexTransform, bound_cls)
+  else:
+    bound_transform_ctor = functools.partial(
+        _ConstrainedNonConvexTransform, bound_cls, imposed_boundprop)
+  return NonConvexAlgorithm(bound_transform_ctor, concretizer, base_boundprop)

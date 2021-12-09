@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 from cvxpy.reductions.solvers.defines import INSTALLED_MI_SOLVERS as MIP_SOLVERS
 import jax.numpy as jnp
-from jax_verify.src.sdp_verify import cvxpy_verify
-from jax_verify.src.sdp_verify import utils
+from jax_verify.extensions.sdp_verify import cvxpy_verify
+from jax_verify.extensions.sdp_verify import utils
 from jax_verify.tests.sdp_verify import test_utils
 
 NO_MIP_SOLVERS_MESSAGE = 'No mixed-integer solver is installed.'

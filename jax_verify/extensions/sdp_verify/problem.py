@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 import collections
 
 import jax.numpy as jnp
-from jax_verify.src.sdp_verify import utils
+from jax_verify.extensions.sdp_verify import utils
 import numpy as np
 
 
@@ -207,5 +207,3 @@ def get_dual_shapes_and_types(bounds_elided):
   dual_shapes.append(np.array([1, N+1]))
   dual_types.append(utils.DualVarTypes.INEQUALITY)
   return dual_shapes, dual_types
-
-

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ from absl import logging
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
-import jax.ops as ops
 import jax.random as random
 import jax.scipy.linalg
 import numpy as np
@@ -77,7 +76,7 @@ def lanczos_alg(matrix_vector_product,
         matrix_vector_product, dim, order, rng_key)
   if use_jax:
     backend = jnp
-    index_update = ops.index_update
+    index_update = lambda x, idx, y: x.at[idx].set(y)
   else:
     backend = np
     def _index_update(array, index, value):
@@ -139,7 +138,7 @@ def _lanczos_alg_dynamic_unroll(
     matrix_vector_product, dim, order, rng_key):
   """Lanczos with jax.fori_loop unroll - see docstring for lanczos_alg()."""
   backend = jnp
-  index_update = ops.index_update
+  index_update = lambda x, idx, y: x.at[idx].set(y)
   tridiag = backend.zeros((order, order))
   vecs = backend.zeros((order, dim))
 

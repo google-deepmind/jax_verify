@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -361,7 +361,7 @@ def _matches(
           # corresponding value in the actual graph.
           key = capture_literals[id(spec_eqn_invar)]
           if key in captures and not _equal_literal_values(
-              spec_eqn_invar.item(), captures[key]):
+              graph_eqn_invar.val, captures[key]):
             # Same keyword param has already captured a different value.
             return no_match
           captures[key] = graph_eqn_invar.val
@@ -492,6 +492,7 @@ def _is_linear_eqn(eqn: jax.core.JaxprEqn, var_is_bound: VarIsBoundDict):
           or (prim in BILINEAR_OP and nb_bound_input == 1)
           or (prim is jax.lax.div_p
               and nb_bound_input == 1
+              and not isinstance(eqn.invars[0], jax.core.Literal)
               and var_is_bound[eqn.invars[0]]))
 
 
@@ -607,7 +608,7 @@ def group_linear_sequence(graph: jax.core.Jaxpr,
     if is_linear_result[outvar]:
       # This is a Linear operation. Let's construct it, possibly including
       # previous linear operations that were waiting to be folded in.
-      lin_invars = set()
+      lin_invars = []
       linear_eqns = []
       for invar in eqn.invars:
         if isinstance(invar, jax.core.Var):
@@ -616,14 +617,15 @@ def group_linear_sequence(graph: jax.core.Jaxpr,
           if invar in to_be_folded:
             subg = to_be_folded[invar]
             for sub_invar in subg.invars:
-              lin_invars.add(sub_invar)
+              lin_invars.append(sub_invar)
             linear_eqns.extend(subg.eqns)
             del to_be_folded[invar]
           else:
-            lin_invars.add(invar)
+            lin_invars.append(invar)
+      # Remove duplicates, preserving order.
+      lin_invars = list(dict.fromkeys(lin_invars))
 
       lin_outvars = [outvar]
-      lin_invars = list(lin_invars)
       if eqn.primitive is linear_p:
         linear_eqns.extend(eqn.params['jax_verify_subgraph'].eqns)
       else:
@@ -829,6 +831,9 @@ class FakePrimitive:
   def __str__(self):
     return self._name
 
+  def __repr__(self):
+    return f'SyntheticPrimitive[{self._name}]'
+
 
 def simplifier_composition(*graph_simplifiers: GraphSimplifier
                            ) -> GraphSimplifier:
@@ -858,7 +863,7 @@ class SubgraphPrimitive(FakePrimitive):
   def bind(self, *args, **kwargs):
     return self._impl(*args, **kwargs)
 
-
+sigmoid_p = FakePrimitive('Sigmoid', jax.nn.sigmoid)
 softplus_p = FakePrimitive('Softplus', jax.nn.softplus)
 softmax_p = FakePrimitive('Softmax', jax.nn.softmax)
 relu_p = FakePrimitive('ReLU', jax.nn.relu)
@@ -889,6 +894,9 @@ def activation_specs() -> Sequence[SyntheticPrimitiveSpec]:
   synthetic_primitive_specs.append(SyntheticPrimitiveSpec(
       jax.nn.leaky_relu, None, leaky_relu_p, [],
       negative_slope=capture_float32))
+  # Sigmoid
+  synthetic_primitive_specs.append(SyntheticPrimitiveSpec(
+      jax.nn.sigmoid, None, sigmoid_p, []))
   return synthetic_primitive_specs
 
 

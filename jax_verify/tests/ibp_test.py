@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ class IBPTest(parameterized.TestCase):
                'b': jnp.array([2.])}}
 
     fun = functools.partial(
-        hk.without_apply_rng(hk.transform(linear_model, apply_rng=True)).apply,
+        hk.without_apply_rng(hk.transform(linear_model)).apply,
         params)
     input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
     output_bounds = jax_verify.interval_bound_propagation(fun, input_bounds)
@@ -65,7 +65,7 @@ class IBPTest(parameterized.TestCase):
                'b': jnp.array([2.])}}
 
     fun = functools.partial(
-        hk.without_apply_rng(hk.transform(conv1d_model, apply_rng=True)).apply,
+        hk.without_apply_rng(hk.transform(conv1d_model)).apply,
         params)
     input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
     output_bounds = jax_verify.interval_bound_propagation(fun, input_bounds)
@@ -85,7 +85,7 @@ class IBPTest(parameterized.TestCase):
                'b': jnp.array([2.])}}
 
     fun = functools.partial(
-        hk.without_apply_rng(hk.transform(conv2d_model, apply_rng=True)).apply,
+        hk.without_apply_rng(hk.transform(conv2d_model)).apply,
         params)
     input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
     output_bounds = jax_verify.interval_bound_propagation(fun, input_bounds)
@@ -99,6 +99,7 @@ class IBPTest(parameterized.TestCase):
       ('relu', jax.nn.relu, [[-2., 3.]]),
       ('softplus', jax.nn.softplus, [[-2., 3.]]),
       ('sign', jnp.sign, [[-2., 3.]]),
+      ('sigmoid', jax.nn.sigmoid, [[-2., 3.]]),
   )
   def test_passthrough_primitive(self, fn, inputs):
     z = jnp.array(inputs)

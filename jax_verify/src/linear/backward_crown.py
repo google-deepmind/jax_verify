@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 """Implementation of Backward Crown / Fastlin.
 """
 import functools
-import math
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
@@ -29,7 +28,6 @@ from jax_verify.src import ibp
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
 from jax_verify.src.linear import linear_bound_utils
-import numpy as np
 import optax
 
 
@@ -41,6 +39,7 @@ Tensor = bound_propagation.Tensor
 GraphInput = graph_traversal.GraphInput
 LayerInput = bound_utils.LayerInput
 Nest = bound_propagation.Nest
+ParameterizedNodeRelaxation = linear_bound_utils.ParameterizedNodeRelaxation
 
 
 def _sum_linear_backward_bounds(linbound_seq: Sequence[LinearExpression]
@@ -200,30 +199,22 @@ class LinearBoundBackwardTransform(
 
   def concrete_bound_chunk(
       self,
-      node_ref: jax.core.Var,
       graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput],
       env: Dict[jax.core.Var, LayerInput],
-      initial_lin_coeffs: Tensor,
-      initial_offsets: Tensor,
-      *bounds: Nest[GraphInput],
-  ) -> Tuple[Tensor, Tensor]:
-    all_bounds_initial_lin_coeffs = jnp.concatenate(
-        [initial_lin_coeffs, -initial_lin_coeffs], axis=0)
-    all_bounds_initial_offsets = jnp.concatenate(
-        [initial_offsets, -initial_offsets], axis=0)
+      node_ref: jax.core.Var,
+      obj: Tensor,
+  ) -> Tensor:
+    initial_linear_expression = identity(obj)
 
-    initial_linear_expression = LinearExpression(
-        all_bounds_initial_lin_coeffs, all_bounds_initial_offsets)
-
-    bound_inputs = [inp for inp in bounds
+    flat_inputs, _ = jax.tree_util.tree_flatten(inputs)
+    bound_inputs = [inp for inp in flat_inputs
                     if isinstance(inp, bound_propagation.Bound)]
     input_nodes_indices = [(i,) for i in range(len(bound_inputs))]
-
     inputs_linfuns, _ = graph.backward_propagation(
         self, env, {node_ref: initial_linear_expression}, input_nodes_indices)
 
-    flat_bound_lower = jnp.zeros(())
-    flat_bound_upper = jnp.zeros(())
+    flat_bound = jnp.zeros(())
     for input_linfun, inp_bound in zip(inputs_linfuns, bound_inputs):
       if input_linfun is not None:
         # Only concretize when the input_linfun is not None. It is possible,
@@ -235,10 +226,10 @@ class LinearBoundBackwardTransform(
         # When computing the bound on the input to the ReLU, the backward
         # bound on b will be None, and can be safely ignored.
         inp_contrib = concretize_backward_bound(input_linfun, inp_bound)
-        flat_bound_lower = flat_bound_lower + inp_contrib.lower
-        flat_bound_upper = flat_bound_upper + inp_contrib.upper
 
-    return flat_bound_lower, flat_bound_upper
+        flat_bound = flat_bound + inp_contrib
+
+    return flat_bound
 
 
 class _RelaxationScanner(graph_traversal.BackwardGraphTransform[LayerInput]):
@@ -252,7 +243,7 @@ class _RelaxationScanner(graph_traversal.BackwardGraphTransform[LayerInput]):
     self._node_relaxations = {}
 
   @property
-  def node_relaxations(self):
+  def node_relaxations(self) -> Dict[Index, ParameterizedNodeRelaxation]:
     return self._node_relaxations
 
   def aggregate(self, eqn_outvals: Sequence[LayerInput]) -> LayerInput:
@@ -272,13 +263,15 @@ class _RelaxationScanner(graph_traversal.BackwardGraphTransform[LayerInput]):
             or primitive in bound_propagation.RESHAPE_PRIMITIVES):
       # This is not an affine primitive. We need to go through a relaxation.
       # Obtain the linear bounds.
-      self._node_relaxations[context.index] = self._relaxer.linearize_primitive(
-          context.index, primitive, *args, **params)
+      arg_shapes = [arg.shape for arg in args]
+      self._node_relaxations[context.index] = (
+          self._relaxer.parameterized_linearizer(
+              context.index, primitive, *arg_shapes, **params))
 
     # We're using this back-transform to traverse the nodes, rather than to
     # compute anything. Arbitrarily return the forward bounds associated with
     # each node.
-    return args
+    return [[arg if isinstance(arg, Bound) else None] for arg in args]
 
 
 class OptimizingLinearBoundBackwardTransform(
@@ -292,6 +285,17 @@ class OptimizingLinearBoundBackwardTransform(
       opt: optax.GradientTransformation,
       num_opt_steps: int,
   ):
+    """Constructs a per-node concretizer that performs an inner optimisation.
+
+    Args:
+      relaxer: Specifies the parameterised linear relaxation to use for each
+        primitive operation.
+      primitive_needs_concrete_bounds: Which primitive operations need to be
+        concretised.
+      opt: Optimiser used to minimise the upper bounds (and the negative lower
+        bounds) with respect to the linear relaxation parameters.
+      num_opt_steps: Number of optimisation steps.
+    """
     self._relaxer = relaxer
     self._primitive_needs_concrete_bounds = primitive_needs_concrete_bounds
     self._opt = opt
@@ -315,57 +319,86 @@ class OptimizingLinearBoundBackwardTransform(
 
   def concrete_bound_chunk(
       self,
-      node_ref: jax.core.Var,
       graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput],
       env: Dict[jax.core.Var, LayerInput],
-      initial_lin_coeffs: Tensor,
-      initial_offsets: Tensor,
-      *bounds: Nest[GraphInput],
-  ) -> Tuple[Tensor, Tensor]:
+      node_ref: jax.core.Var,
+      obj: Tensor,
+  ) -> Tensor:
     # Analyse the relevant parts of the graph.
-    bound_inputs = [inp for inp in bounds
+    flat_inputs, _ = jax.tree_util.tree_flatten(inputs)
+    bound_inputs = [inp for inp in flat_inputs
                     if isinstance(inp, bound_propagation.Bound)]
     input_nodes_indices = [(i,) for i in range(len(bound_inputs))]
     scanner = _RelaxationScanner(self._relaxer)
     graph.backward_propagation(
         scanner, env, {node_ref: env[node_ref]}, input_nodes_indices)
 
-    # Define function to optimise: summary tightness of guaranteed bounds.
-    def objective(relax_params):
-      lb_min, ub_max = self._bind(
-          scanner.node_relaxations, relax_params).concrete_bound_chunk(
-              node_ref, graph, env,
-              initial_lin_coeffs, initial_offsets, *bounds)
-      return jnp.sum(ub_max - lb_min)
+    # Allow lookup of any node's input bounds, for parameter initialisation.
+    graph_inspector = bound_utils.GraphInspector()
+    bound_propagation.ForwardPropagationAlgorithm(
+        graph_inspector).propagate(graph, inputs)
 
-    grad_fn = jax.grad(objective)
+    def input_bounds(index: Index) -> Sequence[LayerInput]:
+      graph_node = graph_inspector.nodes[index]
+      return [env[graph.jaxpr_node(arg.index)]
+              if isinstance(arg, bound_utils.GraphNode) else arg
+              for arg in graph_node.args]
 
-    # Optimise the relaxation parameters.
-    initial_params = {
-        index: node_relaxation.initial_params()
-        for index, node_relaxation in scanner.node_relaxations}
-    initial_state = initial_params, self._opt.init(initial_params)
-    def update_state(state):
-      params, opt_state = state
-      updates, next_opt_state = self._opt.update(grad_fn(params), opt_state)
-      next_params = optax.apply_updates(params, updates)
-      next_params = {
-          index: node_relaxation.project_params(next_params[index])
-          for index, node_relaxation in scanner.node_relaxations}
-      return next_params, next_opt_state
-    relax_params, _ = jax.lax.fori_loop(
-        0, self._num_opt_steps, update_state, initial_state)
+    # Define optimisation for a single neuron's bound. (We'll vmap afterwards.)
+    # This ensures that each neuron uses independent relaxation parameters.
+    def optimized_concrete_bound(one_obj):
+      def concrete_bound(relax_params):
+        return self._bind(
+            scanner.node_relaxations, relax_params).concrete_bound_chunk(
+                graph, inputs, env, node_ref, jnp.expand_dims(one_obj, 0))
 
-    # Evaluate the relaxation at these parameters.
-    relax_params = jax.lax.stop_gradient(relax_params)
-    return self._bind(
-        scanner.node_relaxations, relax_params).concrete_bound_chunk(
-            node_ref, graph, env, initial_lin_coeffs, initial_offsets, *bounds)
+      # Define function to optimise: summary tightness of guaranteed bounds.
+      def objective(relax_params):
+        lb_min = concrete_bound(relax_params)
+        return jnp.sum(-lb_min)
+
+      val_and_grad_fn = jax.value_and_grad(objective)
+
+      # Optimise the relaxation parameters.
+      initial_params = self._initial_params(scanner, input_bounds)
+      initial_state = (initial_params, self._opt.init(initial_params),
+                       initial_params, jnp.inf)
+      def update_state(_, state):
+        params, opt_state, best_params, best_val = state
+        params_val, params_grad = val_and_grad_fn(params)
+        # Compute the next step in the optimization process.
+        updates, next_opt_state = self._opt.update(params_grad, opt_state)
+        next_params = optax.apply_updates(params, updates)
+        next_params = self._project_params(scanner, next_params)
+        # Update the best params seen.
+        params_improved = params_val < best_val
+        update_best_params = lambda p, best: jnp.where(params_improved, p, best)
+
+        next_best_params = jax.tree_multimap(update_best_params,
+                                             params, best_params)
+        next_best_val = jnp.minimum(best_val, params_val)
+        return next_params, next_opt_state, next_best_params, next_best_val
+      _, _, relax_params, _ = jax.lax.fori_loop(
+          0, self._num_opt_steps, update_state, initial_state)
+
+      # Evaluate the relaxation at these parameters.
+      return concrete_bound(jax.lax.stop_gradient(relax_params))
+
+    return jax.vmap(optimized_concrete_bound)(obj)
+
+  def _initial_params(self, scanner, input_bounds):
+    return {index: node_relaxation.initial_params(*input_bounds(index))
+            for index, node_relaxation in scanner.node_relaxations.items()}
+
+  def _project_params(self, scanner, unc_params):
+    return {
+        index: node_relaxation.project_params(unc_params[index])
+        for index, node_relaxation in scanner.node_relaxations.items()}
 
   def _bind(
       self,
-      node_relaxations: Dict[
-          Index, linear_bound_utils.ParameterizedNodeRelaxation],
+      node_relaxations: Dict[Index, ParameterizedNodeRelaxation],
       relax_params: Dict[Index, Tensor],
   ) -> LinearBoundBackwardTransform:
     return LinearBoundBackwardTransform(
@@ -373,8 +406,8 @@ class OptimizingLinearBoundBackwardTransform(
         self._primitive_needs_concrete_bounds)
 
 
-class LinearBoundBackwardConcretizer(bound_utils.BackwardConcretizer):
-  """Transformation to propagate linear bounds backwards and concretize them."""
+class ChunkedBackwardConcretizer(bound_utils.BackwardConcretizer):
+  """Concretizer that invokes the given transform in chunks for each layer."""
 
   def __init__(
       self,
@@ -390,94 +423,84 @@ class LinearBoundBackwardConcretizer(bound_utils.BackwardConcretizer):
   def concretize_args(self, primitive: Primitive) -> bool:
     return self._concretizing_transform.concretize_args(primitive)
 
-  def concrete_bound(self, node_ref: jax.core.Var,
-                     graph: bound_propagation.PropagationGraph,
-                     env: Dict[jax.core.Var, LayerInput],
-                     *bounds: Nest[GraphInput]) -> Bound:
+  def concrete_bound(
+      self,
+      graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput],
+      env: Dict[jax.core.Var, LayerInput],
+      node_ref: jax.core.Var,
+  ) -> ibp.IntervalBound:
     """Perform backward linear bound computation for the node `index`.
 
     Args:
-      node_ref: Reference of the node to obtain a bound for.
       graph: Graph to perform Backward Propagation on.
+      inputs: Bounds on the inputs.
       env: Environment containing intermediate bound and shape information.
-      *bounds: Bounds on the inputs.
+      node_ref: Reference of the node to obtain a bound for.
     Returns:
       concrete_bound: IntervalBound on the activation at `node_ref`.
     """
-    if node_ref in graph.inputs:
-      return bounds[graph.inputs.index(node_ref)]
-
     node = graph_traversal.read_env(env, node_ref)
-    nb_act = np.prod(node.shape)
 
-    def bound_chunk(chunk_index: int) -> Tuple[Tensor, Tensor]:
-      initial_lin_coeffs, initial_offsets = create_opt_problems(
-          node.shape, chunk_index, self._max_chunk_size)
+    def bound_fn(obj: Tensor) -> Tuple[Tensor, Tensor]:
+      # Handle lower bounds and upper bounds independently in the same chunk.
+      obj = jnp.concatenate([obj, -obj], axis=0)
 
-      return self._concretizing_transform.concrete_bound_chunk(
-          node_ref, graph, env, initial_lin_coeffs, initial_offsets, *bounds)
+      all_bounds = self._concretizing_transform.concrete_bound_chunk(
+          graph, inputs, env, node_ref, obj)
 
-    if (self._max_chunk_size == 0) or (nb_act <= self._max_chunk_size):
-      flat_lbs, flat_ubs = bound_chunk(0)
-    else:
-      nb_bound_chunk = math.ceil(nb_act / self._max_chunk_size)
-      chunk_indices = jnp.arange(nb_bound_chunk)
-      (map_lbs, map_ubs) = jax.lax.map(bound_chunk, chunk_indices)
-      # Remove the padding elements
-      flat_lbs = jnp.reshape(map_lbs, (-1,))[:nb_act]
-      flat_ubs = jnp.reshape(map_ubs, (-1,))[:nb_act]
+      # Separate out the lower and upper bounds.
+      lower_bound, neg_upper_bound = jnp.split(all_bounds, 2, axis=0)
+      upper_bound = -neg_upper_bound
+      return lower_bound, upper_bound
 
-    concrete_bound = ibp.IntervalBound(
-        jnp.reshape(flat_lbs, node.shape),
-        jnp.reshape(flat_ubs, node.shape)
-    )
-    return concrete_bound
+    return ibp.IntervalBound(
+        *utils.chunked_bounds(node.shape, self._max_chunk_size, bound_fn))
 
 
-def create_opt_problems(
-    bound_shape,
-    chunk_index,
-    nb_parallel_nodes):
-  """Create the linear coefficients and constants."""
-  obj = utils.objective_chunk(bound_shape, chunk_index, nb_parallel_nodes)
-  # Make the objective for all the samples in the batch
-
-  lin_coeffs = obj
-  offsets = jnp.zeros(obj.shape[:1])
-
-  return lin_coeffs, offsets
+def identity(obj: Tensor) -> LinearExpression:
+  """Returns identity linear expression for lower bound of objective."""
+  initial_lin_coeffs = obj
+  initial_offsets = jnp.zeros(obj.shape[:1])
+  return LinearExpression(initial_lin_coeffs, initial_offsets)
 
 
 def concretize_backward_bound(backward_linexp: LinearExpression,
-                              act_bound: Bound) -> Bound:
-  """Compute the value of a backward bound.
+                              act_bound: Bound) -> Tensor:
+  """Compute the lower bound value of a backward bound.
 
   Args:
-    backward_linexp: Coefficients of linear functions defined over a layer.
-    act_bound: Bound on the activations of that layer.
+    backward_linexp: Coefficients of linear functions. The leading batch
+      dimension corresponds to different functions that need to be concretized.
+    act_bound: Bound on the activations of that layer. Its shape should
+      match the coefficients of the linear functions to concretize.
   Returns:
     bound: A concretized bound on the value of the functions represented by
       backward_linexp.
   """
+  return _concretize_linear_function_interval_bounds(
+    backward_linexp, act_bound)
+
+
+def _concretize_linear_function_interval_bounds(
+    backward_linexp: LinearExpression,
+    act_bound: bound_propagation.IntervalBound) -> Tensor:
+  """Compute the lower bound of a linear function under interval constraints."""
   act_lower = jnp.expand_dims(act_bound.lower, 0)
   act_upper = jnp.expand_dims(act_bound.upper, 0)
 
   dims_to_reduce = tuple(range(1, act_lower.ndim))
 
-  lin_coeffs = backward_linexp.lin_coeffs
-  all_bounds = (backward_linexp.offset
-                + jnp.sum(jnp.minimum(lin_coeffs, 0.) * act_upper
-                          + jnp.maximum(lin_coeffs, 0.) * act_lower,
-                          dims_to_reduce))
-  lower_bound, neg_upper_bound = jnp.split(all_bounds, 2, axis=0)
-  upper_bound = -neg_upper_bound
-
-  return ibp.IntervalBound(lower_bound, upper_bound)
+  return backward_linexp.offset + jnp.sum(
+      jnp.minimum(backward_linexp.lin_coeffs, 0.) * act_upper +
+      jnp.maximum(backward_linexp.lin_coeffs, 0.) * act_lower,
+      dims_to_reduce)
 
 
 CONCRETIZE_ARGS_PRIMITIVE = (
     synthetic_primitives.leaky_relu_p,
     synthetic_primitives.relu_p,
+    synthetic_primitives.sigmoid_p,
     synthetic_primitives.posbilinear_p,
     synthetic_primitives.posreciprocal_p,
     lax.abs_p,
@@ -488,9 +511,9 @@ backward_crown_transform = LinearBoundBackwardTransform(
     linear_bound_utils.crown_rvt_relaxer, CONCRETIZE_ARGS_PRIMITIVE)
 backward_fastlin_transform = LinearBoundBackwardTransform(
     linear_bound_utils.fastlin_rvt_relaxer, CONCRETIZE_ARGS_PRIMITIVE)
-backward_crown_concretizer = LinearBoundBackwardConcretizer(
+backward_crown_concretizer = ChunkedBackwardConcretizer(
     backward_crown_transform)
-backward_fastlin_concretizer = LinearBoundBackwardConcretizer(
+backward_fastlin_concretizer = ChunkedBackwardConcretizer(
     backward_fastlin_transform)
 
 
@@ -578,3 +601,154 @@ def backward_fastlin_bound_propagation(
   output_bound, _ = bound_propagation.bound_propagation(
       backward_fastlin_algorithm, function, *bounds)
   return output_bound
+
+
+class JointOptimizationConcretizationAlgorithm(
+    bound_propagation.PropagationAlgorithm[Bound]
+):
+  """Algorithm to jointly optimize all the bounds in the network."""
+
+  def __init__(self,
+               relaxer: linear_bound_utils.ParameterizedLinearBoundsRelaxer,
+               opt: optax.GradientTransformation,
+               num_opt_steps: int,
+               max_chunk_size: int = 0):
+    self._relaxer = relaxer
+    self._opt = opt
+    self._num_opt_steps = num_opt_steps
+    self._max_chunk_size = max_chunk_size
+
+  def propagate(self,
+                graph: bound_propagation.PropagationGraph,
+                inputs: Nest[GraphInput]):
+
+    # Inspect the graph to figure out what are the nodes needing concretization.
+    graph_inspector = bound_utils.GraphInspector()
+    inspector_algorithm = bound_propagation.ForwardPropagationAlgorithm(
+        graph_inspector)
+    gn_outvals, env = inspector_algorithm.propagate(graph, inputs)
+
+    flat_inputs, _ = jax.tree_util.tree_flatten(inputs)
+    flat_bounds = [inp for inp in flat_inputs
+                   if isinstance(inp, bound_propagation.Bound)]
+    input_nodes_indices = [(i,) for i in range(len(flat_bounds))]
+
+    # For every node that requires relaxations, we will use a RelaxationScanner
+    # to collect the node that it requires.
+    relaxations = {}
+    def collect_relaxations(graph_node):
+      if graph_node.index not in relaxations:
+        index_to_concretize = graph_node.index
+        jaxpr_node = graph.jaxpr_node(index_to_concretize)
+        scanner = _RelaxationScanner(self._relaxer)
+        graph.backward_propagation(
+            scanner, env, {jaxpr_node: graph_node},
+            input_nodes_indices)
+        relaxations[index_to_concretize] = scanner.node_relaxations
+
+    for node in graph_inspector.nodes.values():
+      node_primitive = node.primitive
+      if node_primitive and node_primitive in CONCRETIZE_ARGS_PRIMITIVE:
+        for node_arg in node.args:
+          collect_relaxations(node_arg)
+
+    # Iterate over the outputs, making notes of their index so that we can use
+    # them to specify the objective function, and collecting the relaxations we
+    # need to define to use them.
+    objective_nodes = []
+    for gn in gn_outvals:
+      collect_relaxations(gn)
+      jaxpr_node = graph.jaxpr_node(gn.index)
+      objective_nodes.append(jaxpr_node)
+
+    env_with_final_bounds = self.jointly_optimize_relaxations(
+        relaxations, graph, inputs, env, objective_nodes)
+
+    outvals = [env_with_final_bounds[jaxpr_node_opted]
+               for jaxpr_node_opted in objective_nodes]
+
+    return outvals, env_with_final_bounds
+
+  def jointly_optimize_relaxations(
+      self,
+      relaxations: Dict[Index, Dict[Index, ParameterizedNodeRelaxation]],
+      graph: bound_propagation.PropagationGraph,
+      inputs: Nest[GraphInput],
+      env: Dict[jax.core.Var, LayerInput],
+      objective_nodes: Sequence[jax.core.Var]):
+    """Perform the joint optimization of all the bounds.
+
+    For a network that is (index in parentheses):
+    Inp -> Linear(1) -> Relu(2) -> Linear(3) -> Relu(4) -> Linear(5)
+
+    We would have relaxations be a dict of the form:
+    {
+      (1,): {},  # When we concretize 1, we don't need any relaxations
+      (3,): {(2,): relaxation} # Concretizing 3, we need to relax 2
+      (5,): {(2,): relaxation, (4,): relaxation}
+    }
+    Args:
+      relaxations: Dict mapping each index to a relaxation dict mapping the
+          preceding primitives to their parameterized relaxer.
+      graph: Graph to perform the backward propagation on to obtain bounds.
+      inputs: Bounds on the inputs
+      env: Environment containing shape information
+      objective_nodes: List of jaxpr_nodes indicating which bound to use as
+       objective functions.
+    Returns:
+      env_with_bounds: Environment with concretized bounds.
+    """
+    # Initialize the parameters for the optimization
+    default_init = lambda relax: relax.initial_params(*((None,) * relax.arity))
+    initial_params = jax.tree_map(default_init, relaxations)
+    initial_state = self._opt.init(initial_params)
+    param_and_state = initial_params, initial_state
+
+    # Define a function that compute all bounds that we have parameterized.
+    # This will concretize each intermediate bounds using the parameters
+    # corresponding to that level of the relaxation.
+    def compute_all_bounds(params: Dict[Index, Dict[Index, Nest[Tensor]]]):
+      specific_env = env.copy()
+      for inter_index, node_relaxations in relaxations.items():
+        relax_params = params[inter_index]
+        jaxpr_node = graph.jaxpr_node(inter_index)
+        backward_transform = LinearBoundBackwardTransform(
+            linear_bound_utils.BindRelaxerParams(node_relaxations,
+                                                 relax_params),
+            CONCRETIZE_ARGS_PRIMITIVE)
+        chunked_backward_transform = ChunkedBackwardConcretizer(
+            backward_transform, self._max_chunk_size)
+        concrete_bound = chunked_backward_transform.concrete_bound(
+            graph, inputs, specific_env, jaxpr_node)
+        specific_env[jaxpr_node] = concrete_bound
+      return specific_env
+
+    # Define the objective function of the optimization. This will be the
+    # range of the final bound, as indicated by the objective_nodes argument.
+    def objective_fun(params: Dict[Index, Dict[Index, Nest[Tensor]]]):
+      env_with_bounds = compute_all_bounds(params)
+      obj = 0
+      for jaxpr_node_to_opt in objective_nodes:
+        bound_to_opt = env_with_bounds[jaxpr_node_to_opt]
+        obj = obj + jnp.sum(bound_to_opt.upper - bound_to_opt.lower)
+      return obj
+
+    grad_fn = jax.grad(objective_fun)
+
+    # Define the optimization step, and call it as a fori-loop
+    def update_fun(_, param_and_state):
+      params, opt_state = param_and_state
+      updates, next_opt_state = self._opt.update(grad_fn(params), opt_state)
+      next_params = optax.apply_updates(params, updates)
+      next_params = jax.tree_multimap(
+          lambda relax, param: relax.project_params(param),
+          relaxations, next_params)
+      return next_params, next_opt_state
+    relax_params, _ = jax.lax.fori_loop(
+        0, self._num_opt_steps, update_fun, param_and_state)
+
+    # Compute the bounds corresponding to the final set of optimized
+    # parameters, and extract the final bounds that we were optimizing.
+    env_with_final_bounds = compute_all_bounds(relax_params)
+
+    return env_with_final_bounds

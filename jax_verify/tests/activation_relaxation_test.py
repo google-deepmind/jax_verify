@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,10 +20,15 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import jax
+from jax import lax
 import jax.numpy as jnp
 from jax_verify.src import activation_relaxation
+from jax_verify.src import bound_propagation
 from jax_verify.src import synthetic_primitives
 from jax_verify.tests import test_utils
+
+
+IntervalBound = bound_propagation.IntervalBound
 
 
 TOL = 1e-5
@@ -122,6 +127,9 @@ class ConvexRelaxationTest(parameterized.TestCase):
           (interp_eval - chord_eval).min(), -TOL,
           msg='Function is not concave')
 
+
+class DefaultConvexRelaxationTest(ConvexRelaxationTest):
+
   def test_abs(self):
 
     batch_size = 5
@@ -136,8 +144,8 @@ class ConvexRelaxationTest(parameterized.TestCase):
     inp_lb, inp_ub = test_utils.sample_bounds(bound_key, abs_inp_shape,
                                               minval=-10., maxval=10.)
 
-    lb_fun, ub_fun = activation_relaxation.abs_relaxation(
-        inp_lb, inp_ub)
+    lb_fun, ub_fun = activation_relaxation.convex_fn_relaxation(
+        lax.abs_p, IntervalBound(inp_lb, inp_ub))
 
     # Check that the bounds are valid
     uniform_check_key = jax.random.PRNGKey(1)
@@ -168,11 +176,41 @@ class ConvexRelaxationTest(parameterized.TestCase):
                                               minval=-10., maxval=10.)
 
     lb_fun, ub_fun = activation_relaxation.leaky_relu_relaxation(
-        inp_lb, inp_ub, negative_slope)
+        IntervalBound(inp_lb, inp_ub), negative_slope=negative_slope)
 
     # Check that the bounds are valid
     uniform_check_key = jax.random.PRNGKey(1)
     self._check_bounds(uniform_check_key, leaky_relu_model, lb_fun, ub_fun,
+                       [inp_lb], [inp_ub])
+
+    # Sanity check the convexity of the relaxation
+    cvx_check_key = jax.random.PRNGKey(2)
+    self._check_convexity(cvx_check_key, lb_fun, [inp_lb], [inp_ub], True)
+    ccv_check_key = jax.random.PRNGKey(3)
+    self._check_convexity(ccv_check_key, ub_fun, [inp_lb], [inp_ub], False)
+
+  @parameterized.named_parameters(
+      ('small_scale', 0.01),
+      ('normal_scale', 1),
+      ('large_scale', 1e4),
+      ('very_large_scale', 1e8))
+  def test_sigmoid(self, scale):
+    batch_size = 5
+    axis_dim = 8
+
+    sigmoid_inp_shape = (batch_size, axis_dim)
+    sigmoid = jax.nn.sigmoid
+
+    bound_key = jax.random.PRNGKey(0)
+    inp_lb, inp_ub = test_utils.sample_bounds(bound_key, sigmoid_inp_shape,
+                                              minval=-scale, maxval=scale)
+
+    lb_fun, ub_fun = activation_relaxation.sigmoid_relaxation(
+        IntervalBound(inp_lb, inp_ub))
+
+    # Check that the bounds are valid
+    uniform_check_key = jax.random.PRNGKey(1)
+    self._check_bounds(uniform_check_key, sigmoid, lb_fun, ub_fun,
                        [inp_lb], [inp_ub])
 
     # Sanity check the convexity of the relaxation

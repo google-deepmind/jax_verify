@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,13 @@
 # limitations under the License.
 
 """Utils functions for writing jax_verify tests."""
+import functools
 from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from jax_verify.extensions.sdp_verify import utils
+from jax_verify.tests.sdp_verify import test_utils as sdp_test_utils
 
 
 def sample_bounds(key: jnp.ndarray,
@@ -66,3 +69,15 @@ def sample_bounded_points(key: jnp.ndarray,
 
   bound_range = broad_ub - broad_lb
   return broad_lb + unif_samples * bound_range
+
+
+def set_up_toy_problem(rng_key, batch_size, architecture):
+  key_1, key_2 = jax.random.split(rng_key)
+  params = sdp_test_utils.make_mlp_params(architecture, key_2)
+
+  inputs = jax.random.uniform(key_1, (batch_size, architecture[0]))
+  eps = 0.1
+  lb = jnp.maximum(jnp.minimum(inputs - eps, 1.), 0.)
+  ub = jnp.maximum(jnp.minimum(inputs + eps, 1.), 0.)
+  fun = functools.partial(utils.predict_cnn, params)
+  return fun, (lb, ub)

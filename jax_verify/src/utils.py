@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +15,10 @@
 
 """Utils used for JAX neural network verification."""
 
+import math
 import os
-from typing import Any, Callable, Dict, Sequence, Union
+from typing import Any, Callable, Dict, Sequence, Tuple, Union
+
 import jax
 import jax.numpy as jnp
 from jax_verify.src import bound_propagation
@@ -29,10 +31,9 @@ Bound = bound_propagation.Bound
 
 ######## File Loading ########
 
-def open_file(name, *open_args, **open_kwargs):
+def open_file(name, *open_args, root_dir='/tmp/jax_verify', **open_kwargs):
   """Load file, downloading to /tmp/jax_verify first if necessary."""
-  local_root = '/tmp/jax_verify'
-  local_path = os.path.join(local_root, name)
+  local_path = os.path.join(root_dir, name)
   if not os.path.exists(os.path.dirname(local_path)):
     os.makedirs(os.path.dirname(local_path))
   if not os.path.exists(local_path):
@@ -144,11 +145,45 @@ def objective_chunk(
   opt_idx = jnp.arange(nb_nodes_to_opt)
   node_idx = jnp.minimum(start_node + opt_idx, total_nb_nodes_to_opt-1)
   to_add = ((start_node + opt_idx) < total_nb_nodes_to_opt).astype(jnp.float32)
-  flat_obj = jax.ops.index_add(
-      flat_obj, (opt_idx, node_idx), to_add,
-      indices_are_sorted=True, unique_indices=False)
+  flat_obj = flat_obj.at[(opt_idx, node_idx)].add(
+      to_add, indices_are_sorted=True, unique_indices=False)
   obj = jnp.reshape(flat_obj, (nb_nodes_to_opt, *obj_shape))
 
   return obj
 
 
+def chunked_bounds(
+    bound_shape: Tuple[int, ...],
+    max_parallel_nodes: int,
+    bound_fn: Callable[[Tensor], Tuple[Tensor, Tensor]],
+) -> Tuple[Tensor, Tensor]:
+  """Perform computation of the bounds in chunks.
+
+  Args:
+    bound_shape: Shape of the bounds to compute
+    max_parallel_nodes: How many activations' bounds to compute at once.
+      If zero, compute all the activations' bounds simultaneously.
+    bound_fn: Function to compute bounds for a chunk, given a one-hot tensor
+      of shape (nb_parallel_nodes, *obj_shape) specifying the activation
+      elements to compute.
+  Returns:
+    Computed lower and upper bounds.
+  """
+  def bound_chunk(chunk_index: int) -> Tuple[Tensor, Tensor]:
+    # Create the objective matrix
+    obj = objective_chunk(bound_shape, chunk_index, max_parallel_nodes)
+    return bound_fn(obj)
+
+  nb_act = int(np.prod(bound_shape))
+  if (max_parallel_nodes == 0) or (nb_act <= max_parallel_nodes):
+    flat_lbs, flat_ubs = bound_chunk(0)
+  else:
+    nb_bound_chunk = math.ceil(nb_act / max_parallel_nodes)
+    chunk_indices = jnp.arange(nb_bound_chunk)
+    (map_lbs, map_ubs) = jax.lax.map(bound_chunk, chunk_indices)
+    # Remove the padding elements
+    flat_lbs = jnp.reshape(map_lbs, (-1,))[:nb_act]
+    flat_ubs = jnp.reshape(map_ubs, (-1,))[:nb_act]
+  lbs = jnp.reshape(flat_lbs, bound_shape)
+  ubs = jnp.reshape(flat_ubs, bound_shape)
+  return lbs, ubs

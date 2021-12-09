@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,9 +47,9 @@ import jax
 import jax.numpy as jnp
 import jax_verify
 from jax_verify import sdp_verify
-from jax_verify.src.sdp_verify import boundprop_utils
-from jax_verify.src.sdp_verify import problem
-from jax_verify.src.sdp_verify import utils
+from jax_verify.extensions.sdp_verify import boundprop_utils
+from jax_verify.extensions.sdp_verify import problem
+from jax_verify.extensions.sdp_verify import utils
 import numpy as np
 
 flags.DEFINE_integer('dataset_idx', 1, 'i^th example in dataset')
@@ -124,7 +124,7 @@ def _opt_multiplier_fn(path, kappa_index, kappa_dim=None):
     kappa_lr_mul = FLAGS.custom_kappa_coeff
     if kappa_index in path:
       onehot = jax.nn.one_hot([0], kappa_dim)
-      return jax.ops.index_update(onehot, (0, 0), kappa_lr_mul)
+      return onehot.at[(0, 0)].set(kappa_lr_mul)
   if 'lam' in path:
     return FLAGS.lam_coeff
   if path == (kappa_index - 1, 'nu'):
@@ -160,8 +160,11 @@ def verify_cnn_single_dual(verif_instance):
 
   # Call solver
   obj_value, info = sdp_verify.solve_sdp_dual(
-      verif_instance, num_steps=num_steps, verbose=True,
-      opt_multiplier_fn=opt_multiplier_fn, **solver_params)
+      verif_instance,
+      num_steps=num_steps,
+      verbose=True,
+      opt_multiplier_fn=opt_multiplier_fn,
+      **solver_params)
   info['final_dual_vars'] = jax.tree_map(np.array, info['final_dual_vars'])
   return float(obj_value), info
 

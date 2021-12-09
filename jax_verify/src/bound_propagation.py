@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -96,6 +96,13 @@ class IntervalBound(Bound, InputBound):
     self._lower_bound = lower
     self._upper_bound = upper
 
+  @classmethod
+  def from_jittable(cls, jittable_bound: JittableInputBound):
+    return cls(jittable_bound.lower, jittable_bound.upper)
+
+  def to_jittable(self) -> JittableInputBound:
+    return JittableInputBound(self.lower, self.upper, {IntervalBound: None}, {})
+
 
 def unwrapping(fn):
   """Create a wrapper function to unwrap the bound arguments.
@@ -134,11 +141,10 @@ class PropagationAlgorithm(Generic[Repr], metaclass=abc.ABCMeta):
     """Propagate the given input bounds on the given graph."""
 
 
-class ForwardPropagationAlgorithm(PropagationAlgorithm[Repr],
-                                  metaclass=abc.ABCMeta):
-  """Abstract Forward graph propagation method."""
+class ForwardPropagationAlgorithm(PropagationAlgorithm[Repr]):
+  """Forward graph propagation method."""
 
-  def __init__(self, graph_transform: GraphTransform):
+  def __init__(self, graph_transform: GraphTransform[Repr]):
     self._graph_transform = graph_transform
 
   def propagate(
@@ -148,6 +154,24 @@ class ForwardPropagationAlgorithm(PropagationAlgorithm[Repr],
   ) -> Tuple[Nest[Repr], Dict[jax.core.Var, Union[Repr, Tensor]]]:
     """Propagate forward the given input bounds on the given graph."""
     return graph.forward_propagation(self._graph_transform, bounds)
+
+
+def jit_inputs(*inputs):
+  """Replace all the bound objects by jittable bounds."""
+  is_bound = lambda b: isinstance(b, Bound)
+  jit_bound = lambda b: b.to_jittable()
+  return jax.tree_util.tree_map(
+      lambda b: jit_bound(b) if is_bound(b) else b,
+      inputs, is_leaf=is_bound)
+
+
+def unjit_inputs(*inputs):
+  """Replace all the jittable bounds by standard bound objects."""
+  is_jittable_bound = lambda b: isinstance(b, JittableInputBound)
+  unjit_bound = lambda b: next(iter(b.bound_type)).from_jittable(b)
+  return jax.tree_util.tree_map(
+      lambda b: unjit_bound(b) if is_jittable_bound(b) else b,
+      inputs, is_leaf=is_jittable_bound)
 
 
 def bound_propagation(
@@ -177,10 +201,7 @@ def bound_propagation(
     env: Mapping from the node of the computations to their representation.
   """
   # Replace all the jittable bounds by standard bound object.
-  is_jittable_bound = lambda b: isinstance(b, JittableInputBound)
-  bounds = jax.tree_util.tree_map(
-      lambda b: IntervalBound(b.lower, b.upper) if is_jittable_bound(b) else b,
-      bounds, is_leaf=is_jittable_bound)
+  bounds = unjit_inputs(*bounds)
 
   # Parse the computation graph.
   placeholder_inputs = jax.tree_util.tree_map(
@@ -215,6 +236,7 @@ RESHAPE_PRIMITIVES = [
     lax.concatenate_p,
     lax.gather_p,
     lax.scatter_p,
+    lax.select_p,
 ]
 
 

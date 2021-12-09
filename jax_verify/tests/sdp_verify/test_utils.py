@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The jax_verify Authors.
+# Copyright 2021 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as random
-from jax_verify.src.sdp_verify import utils
+from jax_verify.extensions.sdp_verify import utils
 import numpy as np
 
 ################## Toy Networks ######################
@@ -178,12 +178,10 @@ def make_mlp_layer_from_conv_layer(layer_params, input_bounds):
   pad_b = pad_h - pad_t
   pad_inp_shape = [inp_shape[0] + pad_h, inp_shape[1] + pad_h]
   padded_bounds = jnp.zeros(pad_inp_shape)
-  lb = jax.ops.index_add(padded_bounds, jax.ops.index[pad_t:-pad_b,
-                                                      pad_t:-pad_b],
-                         input_bounds.lb[0, :, :, 0])
-  ub = jax.ops.index_add(padded_bounds, jax.ops.index[pad_t:-pad_b,
-                                                      pad_t:-pad_b],
-                         input_bounds.ub[0, :, :, 0])
+  lb = padded_bounds.at[pad_t:-pad_b, pad_t:-pad_b].add(input_bounds.lb[0, :, :,
+                                                                        0])
+  ub = padded_bounds.at[pad_t:-pad_b, pad_t:-pad_b].add(input_bounds.ub[0, :, :,
+                                                                        0])
   pad_filter_shape = pad_inp_shape + [inp_shape[0], inp_shape[1], w.shape[-1]]
   pad_filter = jnp.zeros(pad_filter_shape)
   pad_bias = jnp.zeros(inp_shape + (w.shape[-1],))
@@ -192,14 +190,12 @@ def make_mlp_layer_from_conv_layer(layer_params, input_bounds):
   # unrolling the conv into an FC layer, stride=(1,1)
   for i in range(inp_shape[0]):
     for j in range(inp_shape[1]):
-      pad_filter = jax.ops.index_add(
-          pad_filter, jax.ops.index[i:i + n_h, j:j + n_w, i, j, 0], w[:, :, 0,
+      pad_filter = pad_filter.at[i:i + n_h, j:j + n_w, i, j, 0].add(w[:, :, 0,
                                                                       0])
-      pad_bias = jax.ops.index_add(pad_bias, jax.ops.index[i, j, 0], b[0])
-      pad_filter = jax.ops.index_add(
-          pad_filter, jax.ops.index[i:i + n_h, j:j + n_w, i, j, 1], w[:, :, 0,
+      pad_bias = pad_bias.at[i, j, 0].add(b[0])
+      pad_filter = pad_filter.at[i:i + n_h, j:j + n_w, i, j, 1].add(w[:, :, 0,
                                                                       1])
-      pad_bias = jax.ops.index_add(pad_bias, jax.ops.index[i, j, 1], b[1])
+      pad_bias = pad_bias.at[i, j, 1].add(b[1])
   pad_filter_lin = jnp.reshape(
       pad_filter,
       (pad_inp_shape[0] * pad_inp_shape[1], inp_shape[0] * inp_shape[1] * 2))

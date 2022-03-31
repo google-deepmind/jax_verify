@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 import jax.numpy as jnp
+import jax_verify
 from jax_verify.src import activation_relaxation
 from jax_verify.src import bound_propagation
 from jax_verify.src import synthetic_primitives
@@ -175,7 +176,8 @@ class DefaultConvexRelaxationTest(ConvexRelaxationTest):
     inp_lb, inp_ub = test_utils.sample_bounds(bound_key, leaky_relu_inp_shape,
                                               minval=-10., maxval=10.)
 
-    lb_fun, ub_fun = activation_relaxation.leaky_relu_relaxation(
+    lb_fun, ub_fun = activation_relaxation.intersection_relaxation(
+        activation_relaxation.leaky_relu_piecewise_linear_relaxation,
         IntervalBound(inp_lb, inp_ub), negative_slope=negative_slope)
 
     # Check that the bounds are valid
@@ -218,6 +220,152 @@ class DefaultConvexRelaxationTest(ConvexRelaxationTest):
     self._check_convexity(cvx_check_key, lb_fun, [inp_lb], [inp_ub], True)
     ccv_check_key = jax.random.PRNGKey(3)
     self._check_convexity(ccv_check_key, ub_fun, [inp_lb], [inp_ub], False)
+
+  def test_fusedrelu(self):
+    inp_dim = 5
+    out_dim = 7
+
+    param_key = jax.random.PRNGKey(0)
+    weight_key, bias_key = jax.random.split(param_key, 2)
+    lin_layer_weight = jax.random.normal(weight_key, (inp_dim, out_dim))
+    lin_layer_bias = jax.random.normal(bias_key, (out_dim,))
+
+    bound_key = jax.random.PRNGKey(1)
+    inp_lb, inp_ub = test_utils.sample_bounds(bound_key, (inp_dim,),
+                                              minval=-1., maxval=1.)
+
+    def linear_layer(inp, lin_weight, lin_bias):
+      return inp @ lin_weight + lin_bias
+
+    def fused_relu_model(inp, lin_weight, lin_bias, *_):
+      return jax.nn.relu(linear_layer(inp, lin_weight, lin_bias))
+
+    # Let's get the jaxpr corresponding to the function, similarly to what would
+    # be extracted by the synthetic primitives simplifier.
+    parsed = synthetic_primitives.make_jaxpr_nojit(
+        fused_relu_model, inp_lb, lin_layer_weight, lin_layer_bias)
+    inp_is_bound = {var: is_bound for var, is_bound
+                    in zip(parsed.jaxpr.invars, [True, False, False])}
+    simplified_graph = synthetic_primitives.simplify_graph(
+        synthetic_primitives.fused_relu_simplifier, parsed.jaxpr, inp_is_bound)
+
+    linear_eqn = simplified_graph.eqns[0]
+    assert linear_eqn.primitive == synthetic_primitives.linear_p
+    relu_eqn = simplified_graph.eqns[1]
+    assert relu_eqn.primitive == synthetic_primitives.fused_relu_p
+
+    net_inp = IntervalBound(inp_lb, inp_ub)
+
+    linear_bound = jax_verify.interval_bound_propagation(
+        linear_layer, net_inp, lin_layer_weight, lin_layer_bias)
+
+    lb_fun, ub_fun = activation_relaxation.fused_relu_relaxation(
+        linear_bound, net_inp, lin_layer_weight, lin_layer_bias,
+        **relu_eqn.params)
+
+    # Check that the bounds are valid
+    def tied_inp_lb_fun(lin_inp, lin_weight, lin_bias):
+      lin_out = linear_layer(lin_inp, lin_weight, lin_bias)
+      return lb_fun(lin_out, lin_inp, lin_weight, lin_bias)
+
+    def tied_inp_ub_fun(lin_inp, lin_weight, lin_bias):
+      lin_out = linear_layer(lin_inp, lin_weight, lin_bias)
+      return ub_fun(lin_out, lin_inp, lin_weight, lin_bias)
+
+    # Check that the bounds are valid
+    uniform_check_key = jax.random.PRNGKey(2)
+    self._check_bounds(
+        uniform_check_key, fused_relu_model, tied_inp_lb_fun, tied_inp_ub_fun,
+        [inp_lb, lin_layer_weight, lin_layer_bias],
+        [inp_ub, lin_layer_weight, lin_layer_bias])
+
+    # Sanity check the convexity of the relaxation
+    cvx_check_key = jax.random.PRNGKey(3)
+    self._check_convexity(
+        cvx_check_key, tied_inp_lb_fun,
+        [inp_lb, lin_layer_weight, lin_layer_bias],
+        [inp_ub, lin_layer_weight, lin_layer_bias], True)
+    ccv_check_key = jax.random.PRNGKey(4)
+    self._check_convexity(
+        ccv_check_key, tied_inp_ub_fun,
+        [inp_lb, lin_layer_weight, lin_layer_bias],
+        [inp_ub, lin_layer_weight, lin_layer_bias], False)
+
+  def test_fusedrelu_conv(self):
+    height = 5
+    width = 5
+    inp_channels = 3
+    out_channels = 4
+    ker_size = 2
+
+    img_shape = (1, inp_channels, height, width)
+    ker_shape = (out_channels, inp_channels, ker_size, ker_size)
+    bias_shape = (1, out_channels, 1, 1)
+
+    param_key = jax.random.PRNGKey(0)
+    weight_key, bias_key = jax.random.split(param_key, 2)
+    lin_kernel_weight = jax.random.normal(weight_key, ker_shape)
+    lin_kernel_bias = jax.random.normal(bias_key, bias_shape)
+
+    bound_key = jax.random.PRNGKey(1)
+    inp_lb, inp_ub = test_utils.sample_bounds(bound_key, img_shape,
+                                              minval=-1., maxval=1.)
+
+    def linear_layer(inp, lin_kernel, lin_bias):
+      return jax.lax.conv(inp, lin_kernel, (1, 1), 'SAME') + lin_bias
+
+    def fused_relu_model(inp, lin_kernel, lin_bias):
+      return jax.nn.relu(linear_layer(inp, lin_kernel, lin_bias))
+
+    # Let's get the jaxpr corresponding to the function, similarly to what would
+    # be extracted by the synthetic primitives simplifier.
+    parsed = synthetic_primitives.make_jaxpr_nojit(
+        fused_relu_model, inp_lb, lin_kernel_weight, lin_kernel_bias)
+    inp_is_bound = {var: is_bound for var, is_bound
+                    in zip(parsed.jaxpr.invars, [True, False, False])}
+    simplified_graph = synthetic_primitives.simplify_graph(
+        synthetic_primitives.fused_relu_simplifier, parsed.jaxpr, inp_is_bound)
+
+    linear_eqn = simplified_graph.eqns[0]
+    assert linear_eqn.primitive == synthetic_primitives.linear_p
+    relu_eqn = simplified_graph.eqns[1]
+    assert relu_eqn.primitive == synthetic_primitives.fused_relu_p
+
+    net_inp = IntervalBound(inp_lb, inp_ub)
+
+    linear_bound = jax_verify.interval_bound_propagation(
+        linear_layer, net_inp, lin_kernel_weight, lin_kernel_bias)
+
+    lb_fun, ub_fun = activation_relaxation.fused_relu_relaxation(
+        linear_bound, net_inp, lin_kernel_weight, lin_kernel_bias,
+        **relu_eqn.params)
+
+    # Check that the bounds are valid
+    def tied_inp_lb_fun(lin_inp, lin_kernel, lin_bias):
+      lin_out = linear_layer(lin_inp, lin_kernel, lin_bias)
+      return lb_fun(lin_out, lin_inp, lin_kernel, lin_bias)
+
+    def tied_inp_ub_fun(lin_inp, lin_kernel, lin_bias):
+      lin_out = linear_layer(lin_inp, lin_kernel, lin_bias)
+      return ub_fun(lin_out, lin_inp, lin_kernel, lin_bias)
+
+    uniform_check_key = jax.random.PRNGKey(2)
+    self._check_bounds(
+        uniform_check_key, fused_relu_model, tied_inp_lb_fun, tied_inp_ub_fun,
+        [inp_lb, lin_kernel_weight, lin_kernel_bias],
+        [inp_ub, lin_kernel_weight, lin_kernel_bias])
+
+    # Sanity check the convexity of the relaxation
+    cvx_check_key = jax.random.PRNGKey(3)
+    self._check_convexity(
+        cvx_check_key, tied_inp_lb_fun,
+        [inp_lb, lin_kernel_weight, lin_kernel_bias],
+        [inp_ub, lin_kernel_weight, lin_kernel_bias], True)
+    ccv_check_key = jax.random.PRNGKey(4)
+    self._check_convexity(
+        ccv_check_key, tied_inp_ub_fun,
+        [inp_lb, lin_kernel_weight, lin_kernel_bias],
+        [inp_ub, lin_kernel_weight, lin_kernel_bias], False)
 
 
 if __name__ == '__main__':

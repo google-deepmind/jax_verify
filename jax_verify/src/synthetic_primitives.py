@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,20 @@ ListNest = Union[T, List[Any]]  # Recursive types not yet supported
 GraphSimplifier = ListNest[
     Callable[[jax.core.Jaxpr, VarIsBoundDict], jax.core.Jaxpr]]
 SimpleSimplifier = Callable[[jax.core.Jaxpr], jax.core.Jaxpr]
+
+
+def filter_jaxverify_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+  if 'jax_verify_keepjvargs' in kwargs and kwargs['jax_verify_keepjvargs']:
+    return kwargs
+  else:
+    return {k: v for k, v in kwargs.items() if not k.startswith('jax_verify')}
+
+
+def make_jaxpr_nojit(fun, *inps, **kwargs):
+  kwarged_fun = functools.partial(fun, **kwargs)
+  with jax.disable_jit():
+    make_jaxpr = jax.make_jaxpr(kwarged_fun)
+    return make_jaxpr(*inps)
 
 
 def simplify_graph(
@@ -135,8 +149,10 @@ class SyntheticPrimitiveSpec:
 
     placeholder_inputs = list(map(jnp.zeros, arg_shapes))
     placeholder_params = {key: 7. for key in capture_keys}
-    make_jaxpr = jax.make_jaxpr(functools.partial(fn, **placeholder_params))
-    self._graph = make_jaxpr(*placeholder_inputs).jaxpr
+
+    closed_jaxpr = make_jaxpr_nojit(fn, *placeholder_inputs,
+                                    **placeholder_params)
+    self._graph = closed_jaxpr.jaxpr
 
     self._capture_literals = {}
     for capture_key in capture_keys:
@@ -145,8 +161,9 @@ class SyntheticPrimitiveSpec:
       # so that we can detect which literals correspond to this keyword param.
       alt_params = {
           key: 8. if key == capture_key else 7. for key in capture_keys}
-      make_alt_jaxpr = jax.make_jaxpr(functools.partial(fn, **alt_params))
-      alt_graph = make_alt_jaxpr(*placeholder_inputs).jaxpr
+
+      closed_jaxpr = make_jaxpr_nojit(fn, *placeholder_inputs, **alt_params)
+      alt_graph = closed_jaxpr.jaxpr
       for literal in _differing_literals(self._graph, alt_graph):
         assert id(literal) not in self._capture_literals
         self._capture_literals[id(literal)] = capture_key
@@ -679,6 +696,97 @@ def group_linear_sequence(graph: jax.core.Jaxpr,
     return simple_graph
 
 
+def group_fused_relu(graph: jax.core.Jaxpr,
+                     var_is_bound: VarIsBoundDict
+                     ) -> jax.core.Jaxpr:
+  """Simplifier identifying FusedRelus (Linear followed by a ReLU).
+
+  The ReLU primitive will be replaced by a FusedRelu primitive, which
+  is responsible for implementing the ReLU, but will in appearance
+  also take the inputs to the linear as input and have as a special
+  parameter the implementation of the linear layer.
+
+  From a graph like this,
+  o ----[linear]------> o -----[relu]----------> o
+  we will move to graph like this:
+    >------------------------------|
+    |                              v
+  o -----[linear]----> o -----[fused_relu]----> o
+                               fused_linear:[linear]
+
+  The goal of this is that we can use the knowledge we have of the
+  preceding linear operation to get a tighter relaxation of the ReLU.
+
+  Args:
+    graph: Jaxpr to simplify.
+    var_is_bound: Dict mapping whether a given variable is a bound or not.
+  Returns:
+    Simplified Jaxpr, where all the fused ReLU have been identified.
+  """
+  # Pass through the network to find what variables are eligible to be
+  # the intermediate variable of a fused ReLU.
+  # The conditions are:
+  #   - produced by a linear.
+  #   - consumed by a ReLU.
+  #   - Not consumed by anything else.
+  is_linear_variable = {}
+  consumed_by = collections.Counter()
+  for eqn in graph.eqns:
+    for invar in eqn.invars:
+      if not isinstance(invar, jax.core.Literal) and var_is_bound[invar]:
+        consumed_by[invar] += 1
+    is_linear_variable[eqn.outvars[0]] = eqn.primitive is linear_p
+  # Increase consumed_by for graph_input so that we don't fuse a graph output.
+  for outvar in graph.outvars:
+    consumed_by[outvar] += 1
+
+  # Identify exactly which variables are involved in FusedRelus, based on the
+  # information collected.
+  fused_relu_interm_to_output = {}
+  for eqn in graph.eqns:
+    if (eqn.primitive is relu_p and
+        is_linear_variable[eqn.invars[0]] and
+        consumed_by[eqn.invars[0]] == 1):
+      fused_relu_interm_to_output[eqn.invars[0]] = eqn.outvars[0]
+
+  # Let's now create the new list of eqns where we replace the eqns involved in
+  # the fused ReLU by the fused ReLU.
+  new_eqns = []
+  for eqn in graph.eqns:
+    if eqn.outvars[0] in fused_relu_interm_to_output:
+      # This is the linear part of the fused ReLU.
+      linear_eqn = eqn
+      # Get the corresponding ReLU.
+      relu_eqn_idx = _find_eqn(graph.eqns,
+                               fused_relu_interm_to_output[eqn.outvars[0]])
+      relu_eqn = graph.eqns[relu_eqn_idx]
+      # Let's now build the fused ReLU primitive
+      non_literal_invars = [invar for invar in eqn.invars
+                            if isinstance(invar, jax.core.Var)]
+      fused_relu_invars = [eqn.outvars[0], *non_literal_invars]
+      fused_relu_jaxpr = jax.core.Jaxpr(
+          constvars=[], invars=fused_relu_invars,
+          outvars=relu_eqn.outvars, eqns=[relu_eqn])
+      # Keep the linear eqn in the jaxpr, so that we can concretize it.
+      new_eqns.append(linear_eqn)
+      # Insert the relu at that level, with an addition of a copy of the
+      # linear operation preceding it so that we can use it for the
+      # relaxation.
+      new_eqns.append(jax.core.new_jaxpr_eqn(
+          fused_relu_jaxpr.invars, fused_relu_jaxpr.outvars, fused_relu_p,
+          {'jax_verify_subgraph': fused_relu_jaxpr,
+           'jax_verify_keepjvargs': True,
+           'jax_verify_fusedlinear': linear_eqn}))
+    elif (eqn.primitive is relu_p and
+          eqn.invars[0] in fused_relu_interm_to_output):
+      # This is the relu part of the fused relu. We already included it.
+      pass
+    else:
+      new_eqns.append(eqn)
+
+  return jax.core.Jaxpr(graph.constvars, graph.invars, graph.outvars, new_eqns)
+
+
 def hoist_constant_computations(graph: jax.core.Jaxpr,
                                 var_is_bound: VarIsBoundDict
                                 ) -> jax.core.Jaxpr:
@@ -803,7 +911,7 @@ def expand_softmax_simplifier(graph: jax.core.Jaxpr,
                         graph.outvars, new_eqns)
 
 
-class FakePrimitive:
+class FakePrimitive(jax.core.Primitive):
   """This wraps an implementation of a primitive we want to identify.
 
   This way our code that assumes that it can go through the primitive by calling
@@ -848,9 +956,9 @@ def simplifier_composition(*graph_simplifiers: GraphSimplifier
 PrimitiveLike = Union[jax.core.Primitive, FakePrimitive]
 
 
-def _subgraph_bind(*args, jax_verify_subgraph, jax_verify_keepjvargs):
+def _subgraph_bind(*args, **kwargs):
   """Implement the primitive by iterating through the subgraph."""
-  del jax_verify_keepjvargs
+  jax_verify_subgraph = kwargs['jax_verify_subgraph']
   return jax.core.eval_jaxpr(jax_verify_subgraph, [], *args)[0]
 
 
@@ -863,6 +971,7 @@ class SubgraphPrimitive(FakePrimitive):
   def bind(self, *args, **kwargs):
     return self._impl(*args, **kwargs)
 
+
 sigmoid_p = FakePrimitive('Sigmoid', jax.nn.sigmoid)
 softplus_p = FakePrimitive('Softplus', jax.nn.softplus)
 softmax_p = FakePrimitive('Softmax', jax.nn.softmax)
@@ -872,6 +981,7 @@ posreciprocal_p = FakePrimitive('PosReciprocal', jax.lax.reciprocal)
 linear_p = SubgraphPrimitive('Linear')
 posbilinear_p = SubgraphPrimitive('PosBilinear')
 quadratic_p = SubgraphPrimitive('Quadratic')
+fused_relu_p = SubgraphPrimitive('FusedRelu')
 
 
 def activation_specs() -> Sequence[SyntheticPrimitiveSpec]:
@@ -903,6 +1013,8 @@ def activation_specs() -> Sequence[SyntheticPrimitiveSpec]:
 PrimitiveLike = Union[jax.core.Primitive, FakePrimitive]
 
 LINEAR_OP = [
+    lax.neg_p,
+    lax.concatenate_p,
     lax.reshape_p,
     lax.squeeze_p,
     lax.transpose_p,
@@ -914,6 +1026,11 @@ LINEAR_OP = [
     lax.sub_p,
     linear_p,
 ]
+if hasattr(lax, 'select_p'):
+  LINEAR_OP.append(lax.select_p)
+if hasattr(lax, 'select_n_p'):
+  LINEAR_OP.append(lax.select_n_p)
+
 
 BILINEAR_OP = [
     lax.dot_general_p,
@@ -932,3 +1049,6 @@ default_simplifier = simplifier_composition(activation_simplifier,
                                             group_linear_sequence,
                                             group_posbilinear,
                                             )
+
+fused_relu_simplifier = simplifier_composition(default_simplifier,
+                                               group_fused_relu)

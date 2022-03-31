@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 import math
 import os
-from typing import Any, Callable, Dict, Sequence, Tuple, Union
+from typing import Callable, Sequence, Tuple, TypeVar, Union
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,18 @@ import urllib.request
 
 Tensor = bound_propagation.Tensor
 Bound = bound_propagation.Bound
+EPSILON = 1.e-12
+
+
+def safe_pos(x: Tensor) -> Tensor:
+  """Returns `x` forced to be strictly positive."""
+  return jnp.maximum(x, EPSILON)
+
+
+def safe_neg(x: Tensor) -> Tensor:
+  """Returns `x` forced to be strictly negitive."""
+  return jnp.minimum(x, -EPSILON)
+
 
 ######## File Loading ########
 
@@ -64,23 +76,6 @@ def bind_nonbound_args(
     assert len(bound_args) == bound_arg_pos
     return fun(*fun_inps, **kwargs)
   return tensorbound_fun
-
-
-def filter_jaxverify_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-  if 'jax_verify_keepjvargs' in kwargs and kwargs['jax_verify_keepjvargs']:
-    return kwargs
-  else:
-    return {k: v for k, v in kwargs.items()
-            if not k.startswith('jax_verify_subgraph')}
-
-
-def simple_propagation(fn):
-  """Create a wrapper function to ignore the context argument."""
-  def wrapper(context, *args, **kwargs):
-    del context
-    params = filter_jaxverify_kwargs(kwargs)
-    return fn(*args, **params)
-  return wrapper
 
 
 def batch_value_and_grad(fun, batch_dims, *args, **kwargs):
@@ -187,3 +182,33 @@ def chunked_bounds(
   lbs = jnp.reshape(flat_lbs, bound_shape)
   ubs = jnp.reshape(flat_ubs, bound_shape)
   return lbs, ubs
+
+
+LoopVal = TypeVar('LoopVal')
+
+
+def fori_loop_no_backprop(
+    lower: Union[int, Tensor],
+    upper: Union[int, Tensor],
+    body_fun: Callable[[int, LoopVal], LoopVal],
+    init_val: LoopVal):
+  """Loop by reduction to `lax.while_loop`, saving memory by avoiding backprop.
+
+  `lax.fori_loop` will reduce to `lax.scan` if `lower` and `upper` are both
+  known at tracing time, so as to support back-propagation. In contrast, this
+  function will always reduce to `lax.while_loop`, which precludes back-prop
+  but avoids retaining the loop state for all iterations.
+
+  Args:
+    lower: Lower bound (inclusive) of the "for" loop index.
+    upper: Upper bound (exclusive) of the "for" loop index.
+    body_fun: Operation to perform in each iteration of the loop.
+    init_val: Input loop value for first iteration of the loop.
+  Returns:
+    final_val: Output loop value from the last iteration of the loop.
+  """
+  _, final_val = jax.lax.while_loop(
+      lambda i_val: i_val[0] < upper,
+      lambda i_val: (i_val[0] + 1, body_fun(i_val[0], i_val[1])),
+      (lower, init_val))
+  return final_val

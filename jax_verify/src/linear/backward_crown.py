@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 
 """Implementation of Backward Crown / Fastlin.
 """
+import abc
 import functools
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -23,23 +24,27 @@ from jax import lax
 import jax.numpy as jnp
 from jax_verify.src import bound_propagation
 from jax_verify.src import bound_utils
+from jax_verify.src import concretization
 from jax_verify.src import graph_traversal
 from jax_verify.src import ibp
+from jax_verify.src import optimizers
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
-from jax_verify.src.linear import linear_bound_utils
+from jax_verify.src.linear import linear_relaxations
 import optax
 
 
-LinearExpression = linear_bound_utils.LinearExpression
+LinFun = linear_relaxations.LinFun
+LinearExpression = linear_relaxations.LinearExpression
 Index = bound_propagation.Index
 Bound = bound_propagation.Bound
+InputBound = bound_propagation.InputBound
 Primitive = bound_propagation.Primitive
 Tensor = bound_propagation.Tensor
 GraphInput = graph_traversal.GraphInput
-LayerInput = bound_utils.LayerInput
+LayerInput = bound_propagation.LayerInput
 Nest = bound_propagation.Nest
-ParameterizedNodeRelaxation = linear_bound_utils.ParameterizedNodeRelaxation
+ParameterizedNodeRelaxation = linear_relaxations.ParameterizedNodeRelaxation
 
 
 def _sum_linear_backward_bounds(linbound_seq: Sequence[LinearExpression]
@@ -51,9 +56,9 @@ def _sum_linear_backward_bounds(linbound_seq: Sequence[LinearExpression]
 
 
 def _backpropagate_linear_functions(
-    linfun: linear_bound_utils.LinFun,
+    linfun: LinFun,
     outval: LinearExpression,
-    *invals: GraphInput)-> List[Optional[LinearExpression]]:
+    *invals: LayerInput)-> List[Optional[LinearExpression]]:
   """Propagate a linear function backward through the linfun function.
 
   Args:
@@ -105,8 +110,8 @@ def _backpropagate_linear_functions(
 
 
 def _handle_linear_relaxation(
-    lb_fun: linear_bound_utils.LinFun,
-    ub_fun: linear_bound_utils.LinFun,
+    lb_fun: LinFun,
+    ub_fun: LinFun,
     outval: LinearExpression,
     *invals: LayerInput) -> List[Optional[LinearExpression]]:
   """Propagate a linear function backward through a linear relaxation.
@@ -158,44 +163,43 @@ def _handle_linear_relaxation(
   return new_in_args
 
 
-class LinearBoundBackwardTransform(
-    bound_utils.BackwardConcretizingTransform[LinearExpression]):
-  """Transformation to propagate linear bounds backwards and concretize them."""
+def concretize_backward_bound(backward_linexp: LinearExpression,
+                              input_bound: InputBound) -> Tensor:
+  """Compute the lower bound value of a backward bound.
+
+  Args:
+    backward_linexp: Coefficients of linear functions. The leading batch
+      dimension corresponds to different output neurons that need to be
+      concretized.
+    input_bound: Bound on the activations of that layer. Its shape should
+      match the coefficients of the linear functions to concretize.
+  Returns:
+    bound: A concretized bound on the value of the functions represented by
+      backward_linexp.
+  """
+  return concretize_linear_function_interval_bounds(
+    backward_linexp, input_bound)
+
+
+class LinearBoundBackwardConcretizingTransform(
+    concretization.BackwardConcretizingTransform[LinearExpression],
+    metaclass=abc.ABCMeta):
+  """Transformation to propagate linear bounds backwards and concretize them.
+
+  This transform propagates instances of the same `LinearExpression` type as
+  used in `forward_linear_bounds`, but note that it interprets them differently:
+  - `lin_coeffs` has shape [nb_outputs, *input_shape]
+  - `offset` has shape [nb_outputs]
+  """
 
   def __init__(
-      self,
-      relaxer: linear_bound_utils.LinearBoundsRelaxer,
-      primitive_needs_concrete_bounds: Tuple[Primitive, ...]):
-    self.relaxer = relaxer
-    self._primitive_needs_concrete_bounds = primitive_needs_concrete_bounds
-
-  def concretize_args(self, primitive: Primitive) -> bool:
-    return primitive in self._primitive_needs_concrete_bounds
+      self, concretization_fn: Callable[[LinearExpression, GraphInput],
+                                        Tensor] = concretize_backward_bound):
+    self._concretization_fn = concretization_fn
 
   def aggregate(self, eqn_outvals: Sequence[LinearExpression]
                 ) -> LinearExpression:
     return _sum_linear_backward_bounds(eqn_outvals)
-
-  def primitive_backtransform(
-      self,
-      context: graph_traversal.TransformContext,
-      primitive: Primitive,
-      eqn_outval: LinearExpression,
-      *args: LayerInput,
-      **params) -> Sequence[Sequence[Optional[LinearExpression]]]:
-    if (primitive in bound_propagation.AFFINE_PRIMITIVES
-        or primitive in bound_propagation.RESHAPE_PRIMITIVES):
-      lin_fun = functools.partial(primitive.bind, **params)
-      in_linfun = _backpropagate_linear_functions(lin_fun, eqn_outval, *args)
-    else:
-      # This is not an affine primitive. We need to go through a relaxation.
-      # Obtain the linear bounds.
-      index = context.index
-      lb_linrelaxfun, ub_linrelaxfun = self.relaxer.linearize_primitive(
-          index, primitive, *args, **params)
-      in_linfun = _handle_linear_relaxation(lb_linrelaxfun, ub_linrelaxfun,
-                                            eqn_outval, *args)
-    return list(zip(in_linfun))
 
   def concrete_bound_chunk(
       self,
@@ -225,11 +229,50 @@ class LinearBoundBackwardTransform(
         #  b -------------------/
         # When computing the bound on the input to the ReLU, the backward
         # bound on b will be None, and can be safely ignored.
-        inp_contrib = concretize_backward_bound(input_linfun, inp_bound)
+        inp_contrib = self._concretization_fn(input_linfun, inp_bound)
 
         flat_bound = flat_bound + inp_contrib
 
     return flat_bound
+
+
+class LinearBoundBackwardTransform(LinearBoundBackwardConcretizingTransform):
+  """Transformation to propagate linear bounds backwards and concretize them."""
+
+  def __init__(
+      self,
+      relaxer: linear_relaxations.LinearBoundsRelaxer,
+      primitive_needs_concrete_bounds: Tuple[Primitive, ...],
+      concretization_fn: Callable[[LinearExpression, GraphInput],
+                                  Tensor] = concretize_backward_bound
+  ):
+    super().__init__(concretization_fn)
+    self.relaxer = relaxer
+    self._primitive_needs_concrete_bounds = primitive_needs_concrete_bounds
+
+  def concretize_args(self, primitive: Primitive) -> bool:
+    return primitive in self._primitive_needs_concrete_bounds
+
+  def primitive_backtransform(
+      self,
+      context: graph_traversal.TransformContext,
+      primitive: Primitive,
+      eqn_outval: LinearExpression,
+      *args: LayerInput,
+      **params) -> Sequence[Sequence[Optional[LinearExpression]]]:
+    if (primitive in bound_propagation.AFFINE_PRIMITIVES
+        or primitive in bound_propagation.RESHAPE_PRIMITIVES):
+      lin_fun = functools.partial(primitive.bind, **params)
+      in_linfun = _backpropagate_linear_functions(lin_fun, eqn_outval, *args)
+    else:
+      # This is not an affine primitive. We need to go through a relaxation.
+      # Obtain the linear bounds.
+      index = context.index
+      lb_linrelaxfun, ub_linrelaxfun = self.relaxer.linearize_primitive(
+          index, primitive, *args, **params)
+      in_linfun = _handle_linear_relaxation(lb_linrelaxfun, ub_linrelaxfun,
+                                            eqn_outval, *args)
+    return list(zip(in_linfun))
 
 
 class _RelaxationScanner(graph_traversal.BackwardGraphTransform[LayerInput]):
@@ -237,8 +280,7 @@ class _RelaxationScanner(graph_traversal.BackwardGraphTransform[LayerInput]):
 
   def __init__(
       self,
-      relaxer: linear_bound_utils.ParameterizedLinearBoundsRelaxer,
-  ):
+      relaxer: linear_relaxations.ParameterizedLinearBoundsRelaxer):
     self._relaxer = relaxer
     self._node_relaxations = {}
 
@@ -275,15 +317,22 @@ class _RelaxationScanner(graph_traversal.BackwardGraphTransform[LayerInput]):
 
 
 class OptimizingLinearBoundBackwardTransform(
-    bound_utils.BackwardConcretizingTransform[LinearExpression]):
-  """Transformation to propagate linear bounds backwards and concretize them."""
+    concretization.BackwardConcretizingTransform[LinearExpression]):
+  """Transformation to propagate linear bounds backwards and concretize them.
+
+  This transform propagates instances of the same `LinearExpression` type as
+  used in `forward_linear_bounds`, but note that it interprets them differently:
+  - `lin_coeffs` has shape [nb_outputs, *input_shape]
+  - `offset` has shape [nb_outputs]
+  """
 
   def __init__(
       self,
-      relaxer: linear_bound_utils.ParameterizedLinearBoundsRelaxer,
+      relaxer: linear_relaxations.ParameterizedLinearBoundsRelaxer,
       primitive_needs_concrete_bounds: Tuple[Primitive, ...],
-      opt: optax.GradientTransformation,
-      num_opt_steps: int,
+      optimizer: optimizers.Optimizer,
+      concretization_fn: Callable[[LinearExpression, GraphInput],
+                                  Tensor] = concretize_backward_bound
   ):
     """Constructs a per-node concretizer that performs an inner optimisation.
 
@@ -292,14 +341,14 @@ class OptimizingLinearBoundBackwardTransform(
         primitive operation.
       primitive_needs_concrete_bounds: Which primitive operations need to be
         concretised.
-      opt: Optimiser used to minimise the upper bounds (and the negative lower
-        bounds) with respect to the linear relaxation parameters.
-      num_opt_steps: Number of optimisation steps.
+      optimizer: Optimizer used to minimise the upper bounds (and the negative
+        lower bounds) with respect to the linear relaxation parameters.
+      concretization_fn: Function to concretize the linear bounds at the end.
     """
     self._relaxer = relaxer
     self._primitive_needs_concrete_bounds = primitive_needs_concrete_bounds
-    self._opt = opt
-    self._num_opt_steps = num_opt_steps
+    self._optimizer = optimizer
+    self._concretization_fn = concretization_fn
 
   def concretize_args(self, primitive: Primitive) -> bool:
     return primitive in self._primitive_needs_concrete_bounds
@@ -327,12 +376,12 @@ class OptimizingLinearBoundBackwardTransform(
   ) -> Tensor:
     # Analyse the relevant parts of the graph.
     flat_inputs, _ = jax.tree_util.tree_flatten(inputs)
-    bound_inputs = [inp for inp in flat_inputs
-                    if isinstance(inp, bound_propagation.Bound)]
+    bound_inputs = [inp for inp in flat_inputs if isinstance(inp, InputBound)]
     input_nodes_indices = [(i,) for i in range(len(bound_inputs))]
     scanner = _RelaxationScanner(self._relaxer)
     graph.backward_propagation(
-        scanner, env, {node_ref: env[node_ref]}, input_nodes_indices)
+        scanner, env, {node_ref: graph_traversal.read_env(env, node_ref)},
+        input_nodes_indices)
 
     # Allow lookup of any node's input bounds, for parameter initialisation.
     graph_inspector = bound_utils.GraphInspector()
@@ -355,35 +404,21 @@ class OptimizingLinearBoundBackwardTransform(
 
       # Define function to optimise: summary tightness of guaranteed bounds.
       def objective(relax_params):
+        # TODO: At the moment we are optimizing the sum of the bounds
+        # but some of the optimizers (Fista + Linesearch) support optimizing
+        # independently each objectives, which would work better.
         lb_min = concrete_bound(relax_params)
         return jnp.sum(-lb_min)
 
-      val_and_grad_fn = jax.value_and_grad(objective)
+      # Define function to project on feasible parameters.
+      project_params = functools.partial(self._project_params, scanner)
 
-      # Optimise the relaxation parameters.
+      opt_fun = self._optimizer.optimize_fn(objective, project_params)
       initial_params = self._initial_params(scanner, input_bounds)
-      initial_state = (initial_params, self._opt.init(initial_params),
-                       initial_params, jnp.inf)
-      def update_state(_, state):
-        params, opt_state, best_params, best_val = state
-        params_val, params_grad = val_and_grad_fn(params)
-        # Compute the next step in the optimization process.
-        updates, next_opt_state = self._opt.update(params_grad, opt_state)
-        next_params = optax.apply_updates(params, updates)
-        next_params = self._project_params(scanner, next_params)
-        # Update the best params seen.
-        params_improved = params_val < best_val
-        update_best_params = lambda p, best: jnp.where(params_improved, p, best)
-
-        next_best_params = jax.tree_multimap(update_best_params,
-                                             params, best_params)
-        next_best_val = jnp.minimum(best_val, params_val)
-        return next_params, next_opt_state, next_best_params, next_best_val
-      _, _, relax_params, _ = jax.lax.fori_loop(
-          0, self._num_opt_steps, update_state, initial_state)
+      best_relax_params = opt_fun(initial_params)
 
       # Evaluate the relaxation at these parameters.
-      return concrete_bound(jax.lax.stop_gradient(relax_params))
+      return concrete_bound(jax.lax.stop_gradient(best_relax_params))
 
     return jax.vmap(optimized_concrete_bound)(obj)
 
@@ -400,62 +435,11 @@ class OptimizingLinearBoundBackwardTransform(
       self,
       node_relaxations: Dict[Index, ParameterizedNodeRelaxation],
       relax_params: Dict[Index, Tensor],
-  ) -> LinearBoundBackwardTransform:
+  ) -> LinearBoundBackwardConcretizingTransform:
     return LinearBoundBackwardTransform(
-        linear_bound_utils.BindRelaxerParams(node_relaxations, relax_params),
-        self._primitive_needs_concrete_bounds)
-
-
-class ChunkedBackwardConcretizer(bound_utils.BackwardConcretizer):
-  """Concretizer that invokes the given transform in chunks for each layer."""
-
-  def __init__(
-      self,
-      concretizing_transform: bound_utils.BackwardConcretizingTransform[
-          LinearExpression],
-      max_chunk_size: int = 0):
-    self._concretizing_transform = concretizing_transform
-    self._max_chunk_size = max_chunk_size
-
-  def should_handle_as_subgraph(self, primitive: Primitive) -> bool:
-    return self._concretizing_transform.should_handle_as_subgraph(primitive)
-
-  def concretize_args(self, primitive: Primitive) -> bool:
-    return self._concretizing_transform.concretize_args(primitive)
-
-  def concrete_bound(
-      self,
-      graph: bound_propagation.PropagationGraph,
-      inputs: Nest[GraphInput],
-      env: Dict[jax.core.Var, LayerInput],
-      node_ref: jax.core.Var,
-  ) -> ibp.IntervalBound:
-    """Perform backward linear bound computation for the node `index`.
-
-    Args:
-      graph: Graph to perform Backward Propagation on.
-      inputs: Bounds on the inputs.
-      env: Environment containing intermediate bound and shape information.
-      node_ref: Reference of the node to obtain a bound for.
-    Returns:
-      concrete_bound: IntervalBound on the activation at `node_ref`.
-    """
-    node = graph_traversal.read_env(env, node_ref)
-
-    def bound_fn(obj: Tensor) -> Tuple[Tensor, Tensor]:
-      # Handle lower bounds and upper bounds independently in the same chunk.
-      obj = jnp.concatenate([obj, -obj], axis=0)
-
-      all_bounds = self._concretizing_transform.concrete_bound_chunk(
-          graph, inputs, env, node_ref, obj)
-
-      # Separate out the lower and upper bounds.
-      lower_bound, neg_upper_bound = jnp.split(all_bounds, 2, axis=0)
-      upper_bound = -neg_upper_bound
-      return lower_bound, upper_bound
-
-    return ibp.IntervalBound(
-        *utils.chunked_bounds(node.shape, self._max_chunk_size, bound_fn))
+        linear_relaxations.BindRelaxerParams(node_relaxations, relax_params),
+        self._primitive_needs_concrete_bounds,
+        self._concretization_fn)
 
 
 def identity(obj: Tensor) -> LinearExpression:
@@ -465,29 +449,12 @@ def identity(obj: Tensor) -> LinearExpression:
   return LinearExpression(initial_lin_coeffs, initial_offsets)
 
 
-def concretize_backward_bound(backward_linexp: LinearExpression,
-                              act_bound: Bound) -> Tensor:
-  """Compute the lower bound value of a backward bound.
-
-  Args:
-    backward_linexp: Coefficients of linear functions. The leading batch
-      dimension corresponds to different functions that need to be concretized.
-    act_bound: Bound on the activations of that layer. Its shape should
-      match the coefficients of the linear functions to concretize.
-  Returns:
-    bound: A concretized bound on the value of the functions represented by
-      backward_linexp.
-  """
-  return _concretize_linear_function_interval_bounds(
-    backward_linexp, act_bound)
-
-
-def _concretize_linear_function_interval_bounds(
+def concretize_linear_function_interval_bounds(
     backward_linexp: LinearExpression,
-    act_bound: bound_propagation.IntervalBound) -> Tensor:
+    input_bound: bound_propagation.IntervalBound) -> Tensor:
   """Compute the lower bound of a linear function under interval constraints."""
-  act_lower = jnp.expand_dims(act_bound.lower, 0)
-  act_upper = jnp.expand_dims(act_bound.upper, 0)
+  act_lower = jnp.expand_dims(input_bound.lower, 0)
+  act_upper = jnp.expand_dims(input_bound.upper, 0)
 
   dims_to_reduce = tuple(range(1, act_lower.ndim))
 
@@ -504,16 +471,16 @@ CONCRETIZE_ARGS_PRIMITIVE = (
     synthetic_primitives.posbilinear_p,
     synthetic_primitives.posreciprocal_p,
     lax.abs_p,
-    lax.exp_p
+    lax.exp_p,
 )
 
 backward_crown_transform = LinearBoundBackwardTransform(
-    linear_bound_utils.crown_rvt_relaxer, CONCRETIZE_ARGS_PRIMITIVE)
+    linear_relaxations.crown_rvt_relaxer, CONCRETIZE_ARGS_PRIMITIVE)
 backward_fastlin_transform = LinearBoundBackwardTransform(
-    linear_bound_utils.fastlin_rvt_relaxer, CONCRETIZE_ARGS_PRIMITIVE)
-backward_crown_concretizer = ChunkedBackwardConcretizer(
+    linear_relaxations.fastlin_rvt_relaxer, CONCRETIZE_ARGS_PRIMITIVE)
+backward_crown_concretizer = concretization.ChunkedBackwardConcretizer(
     backward_crown_transform)
-backward_fastlin_concretizer = ChunkedBackwardConcretizer(
+backward_fastlin_concretizer = concretization.ChunkedBackwardConcretizer(
     backward_fastlin_transform)
 
 
@@ -532,7 +499,7 @@ def crownibp_bound_propagation(
   Returns:
     output_bounds: Bounds on the outputs of the function obtained by Crown-IBP
   """
-  crown_ibp_algorithm = bound_utils.BackwardAlgorithmForwardConcretization(
+  crown_ibp_algorithm = concretization.BackwardAlgorithmForwardConcretization(
       ibp.bound_transform, backward_crown_concretizer)
   output_bounds, _ = bound_propagation.bound_propagation(
       crown_ibp_algorithm, function, *bounds)
@@ -551,7 +518,7 @@ def backward_crown_bound_propagation(
   Returns:
     output_bound: Bounds on the output of the function obtained by FastLin
   """
-  backward_crown_algorithm = bound_utils.BackwardConcretizingAlgorithm(
+  backward_crown_algorithm = concretization.BackwardConcretizingAlgorithm(
       backward_crown_concretizer)
   output_bound, _ = bound_propagation.bound_propagation(
       backward_crown_algorithm, function, *bounds)
@@ -570,7 +537,7 @@ def backward_rvt_bound_propagation(
   Returns:
     output_bound: Bounds on the output of the function obtained by FastLin
   """
-  backward_crown_algorithm = bound_utils.BackwardConcretizingAlgorithm(
+  backward_crown_algorithm = concretization.BackwardConcretizingAlgorithm(
       backward_crown_concretizer)
   expand_softmax_simplifier_chain = synthetic_primitives.simplifier_composition(
       synthetic_primitives.activation_simplifier,
@@ -596,7 +563,7 @@ def backward_fastlin_bound_propagation(
   Returns:
     output_bound: Bounds on the output of the function obtained by FastLin
   """
-  backward_fastlin_algorithm = bound_utils.BackwardConcretizingAlgorithm(
+  backward_fastlin_algorithm = concretization.BackwardConcretizingAlgorithm(
       backward_fastlin_concretizer)
   output_bound, _ = bound_propagation.bound_propagation(
       backward_fastlin_algorithm, function, *bounds)
@@ -609,7 +576,7 @@ class JointOptimizationConcretizationAlgorithm(
   """Algorithm to jointly optimize all the bounds in the network."""
 
   def __init__(self,
-               relaxer: linear_bound_utils.ParameterizedLinearBoundsRelaxer,
+               relaxer: linear_relaxations.ParameterizedLinearBoundsRelaxer,
                opt: optax.GradientTransformation,
                num_opt_steps: int,
                max_chunk_size: int = 0):
@@ -713,10 +680,10 @@ class JointOptimizationConcretizationAlgorithm(
         relax_params = params[inter_index]
         jaxpr_node = graph.jaxpr_node(inter_index)
         backward_transform = LinearBoundBackwardTransform(
-            linear_bound_utils.BindRelaxerParams(node_relaxations,
+            linear_relaxations.BindRelaxerParams(node_relaxations,
                                                  relax_params),
             CONCRETIZE_ARGS_PRIMITIVE)
-        chunked_backward_transform = ChunkedBackwardConcretizer(
+        chunked_backward_transform = concretization.ChunkedBackwardConcretizer(
             backward_transform, self._max_chunk_size)
         concrete_bound = chunked_backward_transform.concrete_bound(
             graph, inputs, specific_env, jaxpr_node)
@@ -744,7 +711,7 @@ class JointOptimizationConcretizationAlgorithm(
           lambda relax, param: relax.project_params(param),
           relaxations, next_params)
       return next_params, next_opt_state
-    relax_params, _ = jax.lax.fori_loop(
+    relax_params, _ = utils.fori_loop_no_backprop(
         0, self._num_opt_steps, update_fun, param_and_state)
 
     # Compute the bounds corresponding to the final set of optimized

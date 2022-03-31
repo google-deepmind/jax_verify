@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Routines to solve the subproblem during verification."""
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -22,10 +21,10 @@ import cvxpy as cp
 from cvxpy.reductions.solvers.defines import INSTALLED_MI_SOLVERS as MIP_SOLVERS
 import jax
 import jax.numpy as jnp
+from jax_verify.src import utils
 from jax_verify.src.mip_solver import relaxation
 import numpy as np
 
-_EPS = 1e-10
 CvxpyConstraint = cp.constraints.constraint.Constraint
 Tensor = np.ndarray
 
@@ -78,7 +77,7 @@ class CvxpySolver(relaxation.RelaxationSolver):
       if isinstance(constraint_variable, relaxation.RelaxVariable):
         current_variable = self.solver_variables[constraint_variable.name]
         for component, coeff in zip(cpts, coeffs):
-          if np.abs(coeff) > _EPS:
+          if np.abs(coeff) > utils.EPSILON:
             rhs += current_variable[component] * coeff.item()
     if constraint.sense == 0:
       self.constraints += [rhs == 0]
@@ -135,7 +134,7 @@ class CvxpySolver(relaxation.RelaxationSolver):
     # Define the objective function
     obj = cp.expressions.constants.Constant(0.)
     for i, coeff in enumerate(objective):
-      if np.abs(coeff) > _EPS:
+      if np.abs(coeff) > utils.EPSILON:
         obj += self.solver_variables[var_name][i] * coeff.item()
     objective = cp.Minimize(obj)
     prob = cp.Problem(objective, self.constraints)

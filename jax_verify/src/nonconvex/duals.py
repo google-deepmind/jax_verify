@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,9 @@ WolfeDualFn = Callable[[ParamSet, Tensor, ParamSet, Tensor, Tensor, ParamSet],
                        Tensor]
 LagrangianLevelFn = Callable[[Tensor, ParamSet], Tensor]
 LagrangianBoundingFn = Callable[[Tensor, ParamSet], Tensor]
-LagrangianVarTerm = Tuple[str, Callable[..., Tensor]]
+LagrangianVarTerm = Tuple[
+    Union[str, bound_propagation.Primitive],
+    Callable[..., Tensor]]
 LagrangianDict = DefaultDict[Index, List[LagrangianVarTerm]]
 LagrangianVartermsFn = Callable[[Tensor, LagrangianDict], None]
 
@@ -213,7 +215,7 @@ class WolfeNonConvexBound(nonconvex.ConstrainedNonConvexBound):
   def get_nonlinearity_activation_constructor(
       cls: Callable[..., 'WolfeNonConvexBound'],
       index: Index,
-      act_type: str,
+      act_type: bound_propagation.Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor],
       *inp: 'WolfeNonConvexBound',
@@ -424,13 +426,12 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   def get_nonlinearity_activation_constructor(
       cls: Callable[..., 'LinLagrangianNonConvexBound'],
       index: Index,
-      act_type: str,
+      act_type: bound_propagation.Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor],
       *inp: 'LinLagrangianNonConvexBound',
       ) -> Callable[..., 'LinLagrangianNonConvexBound']:
     assert len(inp) == 1
-    assert act_type == 'Softplus' or act_type == 'ReLU'
     inp = inp[0]
     def lagrangian_level_fn(dvar: Tensor, acts: ParamSet) -> Tensor:
       pos_dvar = jnp.maximum(dvar, 0.)
@@ -449,8 +450,8 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     # - The lower bound is exact.
     # - The lower/upper bound on the output can be obtained by forwarding
     #   through the exact function the lower/upper bound on the input.
-    out_lb = lb_fun(inp.lower)
-    out_ub = lb_fun(inp.upper)
+    out_lb = lb_fun(jnp.expand_dims(inp.lower, 0))
+    out_ub = lb_fun(jnp.expand_dims(inp.upper, 0))
 
     def bounding_fn(lag_grad: Tensor, acts: ParamSet) -> Tensor:
       act_out_eval = acts[index]
@@ -539,8 +540,8 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
 
     minimized_lagrangian = self._objective_fn(opt_acts, objectives)
     for index, lag_terms in lagrangian_terms.items():
-      for term in lag_terms:
-        out_term = term[1](opt_acts[index])
+      for _, lag_term_fn in lag_terms:
+        out_term = lag_term_fn(opt_acts[index])
         minimized_lagrangian = minimized_lagrangian + _sum_over_acts(out_term)
 
     return primals, minimized_lagrangian
@@ -618,13 +619,13 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   def get_nonlinearity_activation_constructor(
       cls: Callable[..., 'MinLagrangianNonConvexBound'],
       index: Index,
-      act_type: str,
+      act_type: bound_propagation.Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor],
       *inp: 'MinLagrangianNonConvexBound',
       ) -> Callable[..., 'MinLagrangianNonConvexBound']:
     assert len(inp) == 1
-    assert act_type == 'Softplus' or act_type == 'ReLU'
+    assert act_type in _lagrangian_opt_fns
     inp = inp[0]
     def lagrangian_varterms_fn(dvar: Tensor, lagrangian_dict: LagrangianDict):
       # There is a linear term of dvar over the outputs.
@@ -662,30 +663,31 @@ def _optimize_lagrangian_terms(lagrangian_terms: List[LagrangianVarTerm],
   # Get the total linear term
   def linear_term(x):
     out = 0
-    for term in lagrangian_terms:
-      if term[0] == 'Linear':
-        out += term[1](x).sum()
+    for act_type, lag_term_fn in lagrangian_terms:
+      if act_type == 'Linear':
+        out += lag_term_fn(x).sum()
     return out
 
   # Identify the NonLinear term if there is one
-  for term in lagrangian_terms:
-    if term[0] in _lagrangian_opt_fns:
+  for act_type, lag_term_fn in lagrangian_terms:
+    if act_type in _lagrangian_opt_fns:
       if act_term is not None:
         raise ValueError('Variable involved in several activations.')
-      act_term = term
-    elif term[0] == 'Linear':
-      continue
+      act_term = act_type, lag_term_fn
+    elif act_type == 'Linear':
+      pass
     else:
-      raise ValueError('Unexpected contribution.')
+      raise ValueError('Unexpected contribution: ' + act_type)
 
   # Perform the minimization
   lin_coeffs = jax.grad(linear_term)(lower_bound)
   if act_term is None:
-    # This does not involve a non linearity, this is just a linear term
+    # This does not involve a non linearity; this is just a linear term.
     return jnp.where(lin_coeffs >= 0, lower_bound, upper_bound)
   else:
-    return _lagrangian_opt_fns[act_term[0]](lin_coeffs, act_term[1],
-                                            lower_bound, upper_bound)
+    act_type, lag_term_fn = act_term
+    return _lagrangian_opt_fns[act_type](
+        lin_coeffs, lag_term_fn, lower_bound, upper_bound)
 
 
 def _optimize_softplus_lagrangian(lin_coeffs: Tensor,
@@ -763,6 +765,6 @@ def _optimize_relu_lagrangian(lin_coeffs: Tensor,
 
 
 _lagrangian_opt_fns = {
-    'ReLU': _optimize_relu_lagrangian,
-    'Softplus': _optimize_softplus_lagrangian
+    synthetic_primitives.relu_p: _optimize_relu_lagrangian,
+    synthetic_primitives.softplus_p: _optimize_softplus_lagrangian,
 }

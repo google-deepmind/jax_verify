@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ Tensor = jnp.ndarray
 T = TypeVar('T')
 Nest = Union[T, Sequence[T], Dict[Any, T]]
 Primitive = Union[jax.core.Primitive, synthetic_primitives.FakePrimitive]
-Index = Tuple[int]
+Index = Any  # Tuple[*int]
 
 
 class InputBound(metaclass=abc.ABCMeta):
@@ -48,19 +48,7 @@ class InputBound(metaclass=abc.ABCMeta):
     """Concrete upper bound."""
 
 
-# (lower, upper) input bound represented as a Tensor nest so that it can
-# be passed as a parameter to a Jax jitted function.
-# `bound_type` should be a dictionary using the desired bound class as a key
-# (the value that the key maps to is unimportant). This way, jax does not
-# complain about it not being a jax type.
-# Example: {jax_verify.IntervalBound: None}
-# Additional arguments can be provided in `kwargs`,
-# The Bound class should implement a `from_jittable` class method, to
-# instantiate the object based on the jittable bound.
-JittableInputBound = collections.namedtuple(
-    'JittableInputBound', ['lower', 'upper', 'bound_type', 'kwargs'])
-
-GraphInput = Union[InputBound, JittableInputBound, Tensor]
+GraphInput = Union[InputBound, Tensor]
 
 
 class TransformedNode(metaclass=abc.ABCMeta):
@@ -91,15 +79,13 @@ class GraphTransform(Generic[Repr], metaclass=abc.ABCMeta):
   def input_transform(
       self,
       context: TransformContext,
-      lower_bound: Tensor,
-      upper_bound: Tensor,
+      input_bound: InputBound,
   ) -> Repr:
-    """Constructs input representations from lower/upper bound tensors.
+    """Constructs input representations from a concrete input bound.
 
     Args:
       context: Transform context containing node index.
-      lower_bound: Original concrete lower bound on the input.
-      upper_bound: Original concrete upper bound on the input.
+      input_bound: Original concrete bounds on the input.
 
     Returns:
       Method-specific representation for the inputs.
@@ -275,11 +261,13 @@ class BackwardOpwiseTransform(BackwardGraphTransform[BackRepr]):
       **params) -> Sequence[Sequence[Optional[BackRepr]]]:
     if primitive not in self._primitive_backtransform:
       raise NotImplementedError(f'Unknown Primitive: {primitive}.')
+    del context
+    params = synthetic_primitives.filter_jaxverify_kwargs(params)
     # Promote each output to a single-length list.
     # This is for consistency with the sub-graph handler, in which output is
     # returned as a list according to the multiple paths through the graph.
     return list(zip(self._primitive_backtransform[primitive](
-        context, eqn_outval, *args, **params)))
+        eqn_outval, *args, **params)))
 
   def should_handle_as_subgraph(self, primitive: Primitive) -> bool:
     if (isinstance(primitive, synthetic_primitives.FakePrimitive) and
@@ -297,18 +285,21 @@ class OpwiseGraphTransform(GraphTransform[Repr]):
 
   def __init__(
       self,
-      input_transform: Callable[[Index, Tensor, Tensor], Repr],
+      input_transform: Callable[[InputBound], Repr],
       primitive_transform: Dict[Primitive, Callable[..., Repr]]):
     self._input_transform = input_transform
     self._primitive_transform = primitive_transform
 
-  def input_transform(self, context, lower_bound, upper_bound):
-    return self._input_transform(context, lower_bound, upper_bound)
+  def input_transform(self, context, input_bound):
+    del context
+    return self._input_transform(input_bound)
 
   def primitive_transform(self, context, primitive, *args, **params):
     if primitive not in self._primitive_transform:
       raise NotImplementedError(f'Unknown Primitive: {primitive}')
-    return self._primitive_transform[primitive](context, *args, **params)
+    del context
+    params = synthetic_primitives.filter_jaxverify_kwargs(params)
+    return self._primitive_transform[primitive](*args, **params)
 
   def should_handle_as_subgraph(self, primitive: Primitive) -> bool:
     if (isinstance(primitive, synthetic_primitives.FakePrimitive) and
@@ -327,9 +318,8 @@ class UpdatedGraphTransform(GraphTransform[Repr]):
     self._base_transform = base_transform
     self._updated_primitive_transform = updated_primitive_transform
 
-  def input_transform(self, context, lower_bound, upper_bound):
-    return self._base_transform.input_transform(
-        context, lower_bound, upper_bound)
+  def input_transform(self, context, input_bound):
+    return self._base_transform.input_transform(context, input_bound)
 
   def primitive_transform(self, context, primitive, *args, **params):
     if primitive in self._updated_primitive_transform:
@@ -443,8 +433,8 @@ class PropagationGraph:
     Args:
       transform: Basic Jax primitive ops' equivalents for operating on
         the representation (e.g. bound propagation).
-      bounds: Nest of `InputBound` objects containing the lower and upper
-        bounds on all the inputs, or `Tensor`s containing known inputs directly.
+      bounds: Nest of `InputBound` objects containing the bounds on all the
+      inputs, or `Tensor`s containing known inputs directly.
     Returns:
       outvals: Propagated values corresponding to the graph output.
       env: Dictionary holding the computed bounds on nodes of the graph.
@@ -452,15 +442,14 @@ class PropagationGraph:
 
     # Initialize the environment based on the provided bounds.
     env = {}
-    is_bound = lambda b: isinstance(b, (TransformedNode, JittableInputBound))
+    is_bound = lambda b: isinstance(b, InputBound)
     flat_bounds, _ = jax.tree_util.tree_flatten(bounds, is_leaf=is_bound)
     invals = []
     index = IndexCounter()
     for bound, invar in zip(flat_bounds, self._graph.invars):
       if is_bound(bound):
         input_val = transform.input_transform(
-            TransformContext(index.as_tuple(), None),
-            bound.lower, bound.upper)
+            TransformContext(index.as_tuple(), None), bound)
         self._index_to_node[index.as_tuple()] = invar
         index.incr()
       else:

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -114,9 +114,8 @@ class _LagrangianTransform(bound_propagation.GraphTransform[DualOp]):
     """
     self._boundprop_transform = boundprop_transform
 
-  def input_transform(self, context, lower_bound, upper_bound):
-    in_bounds = self._boundprop_transform.input_transform(
-        context, lower_bound, upper_bound)
+  def input_transform(self, context, input_bound):
+    in_bounds = self._boundprop_transform.input_transform(context, input_bound)
     return DualOp(context.index, in_bounds, lambda x: x, inputs=None)
 
   def primitive_transform(self, context, primitive, *args, **params):

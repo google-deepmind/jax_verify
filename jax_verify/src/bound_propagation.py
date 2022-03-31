@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,8 @@ This is accomplished by traversing the JaxPR representation of the computation
 and translating the computational graph.
 """
 import abc
-from typing import Callable, Dict, Generic, Tuple, TypeVar, Union
+import collections
+from typing import Callable, Dict, Generic, List, Tuple, TypeVar, Union
 
 import jax
 from jax import lax
@@ -35,7 +36,6 @@ Primitive = graph_traversal.Primitive
 Index = graph_traversal.Index
 GraphInput = graph_traversal.GraphInput
 InputBound = graph_traversal.InputBound
-JittableInputBound = graph_traversal.JittableInputBound
 TransformContext = graph_traversal.TransformContext
 PropagationGraph = graph_traversal.PropagationGraph
 GraphTransform = graph_traversal.GraphTransform
@@ -44,6 +44,20 @@ UpdatedGraphTransform = graph_traversal.UpdatedGraphTransform
 BackwardGraphTransform = graph_traversal.BackwardGraphTransform
 BackwardOpwiseTransform = graph_traversal.BackwardOpwiseTransform
 Repr = TypeVar('Repr', bound=graph_traversal.TransformedNode)
+
+
+# (lower, upper) input bound represented as a Tensor nest so that it can
+# be passed as a parameter to a Jax jitted function.
+# `bound_type` should be a dictionary using the desired bound class as a key
+# (the value that the key maps to is unimportant). This way, jax does not
+# complain about it not being a jax type.
+# Example: {jax_verify.IntervalBound: None}
+# Additional arguments can be provided in `kwargs`,
+# The Bound class should implement a `from_jittable` class method, to
+# instantiate the object based on the jittable bound.
+JittableInputBound = collections.namedtuple(
+    'JittableInputBound', ['lower', 'upper', 'bound_type', 'kwargs'])
+JittableGraphInput = Union[JittableInputBound, Tensor]
 
 
 class Bound(graph_traversal.TransformedNode):
@@ -73,6 +87,9 @@ class Bound(graph_traversal.TransformedNode):
       Underlying bound arising directly from bound propagation.
     """
     return self
+
+
+LayerInput = Union[Bound, Tensor]
 
 
 class IntervalBound(Bound, InputBound):
@@ -126,8 +143,6 @@ def unwrapping(fn):
 
 
 BoundTransform = GraphTransform[Bound]
-OpwiseBoundTransform = OpwiseGraphTransform[Bound]
-UpdatedBoundTransform = UpdatedGraphTransform[Bound]
 
 
 class PropagationAlgorithm(Generic[Repr], metaclass=abc.ABCMeta):
@@ -156,7 +171,7 @@ class ForwardPropagationAlgorithm(PropagationAlgorithm[Repr]):
     return graph.forward_propagation(self._graph_transform, bounds)
 
 
-def jit_inputs(*inputs):
+def jit_inputs(*inputs: Nest[GraphInput]) -> List[Nest[JittableGraphInput]]:
   """Replace all the bound objects by jittable bounds."""
   is_bound = lambda b: isinstance(b, Bound)
   jit_bound = lambda b: b.to_jittable()
@@ -165,7 +180,7 @@ def jit_inputs(*inputs):
       inputs, is_leaf=is_bound)
 
 
-def unjit_inputs(*inputs):
+def unjit_inputs(*inputs: Nest[JittableGraphInput]) -> List[Nest[GraphInput]]:
   """Replace all the jittable bounds by standard bound objects."""
   is_jittable_bound = lambda b: isinstance(b, JittableInputBound)
   unjit_bound = lambda b: next(iter(b.bound_type)).from_jittable(b)
@@ -200,15 +215,11 @@ def bound_propagation(
       as the output of `function`
     env: Mapping from the node of the computations to their representation.
   """
-  # Replace all the jittable bounds by standard bound object.
-  bounds = unjit_inputs(*bounds)
-
   # Parse the computation graph.
   placeholder_inputs = jax.tree_util.tree_map(
       lambda b: b.lower if isinstance(b, Bound) else b,
       bounds)
-  jaxpr_maker = jax.make_jaxpr(function)
-  parsed = jaxpr_maker(*placeholder_inputs)
+  parsed = synthetic_primitives.make_jaxpr_nojit(function, *placeholder_inputs)
   output_shapes = jax.eval_shape(function, *placeholder_inputs)
 
   flat_is_bound, _ = jax.tree_util.tree_flatten(
@@ -236,9 +247,11 @@ RESHAPE_PRIMITIVES = [
     lax.concatenate_p,
     lax.gather_p,
     lax.scatter_p,
-    lax.select_p,
 ]
-
+if hasattr(lax, 'select_p'):
+  RESHAPE_PRIMITIVES.append(lax.select_p)
+if hasattr(lax, 'select_n_p'):
+  RESHAPE_PRIMITIVES.append(lax.select_n_p)
 
 BILINEAR_PRIMITIVES = [
     lax.mul_p,
@@ -258,6 +271,7 @@ AFFINE_PRIMITIVES = [
     lax.add_p,
     lax.sub_p,
     lax.reduce_sum_p,
+    lax.neg_p,
     synthetic_primitives.linear_p,
 ] + BILINEAR_PRIMITIVES
 # lax.div_p can also be treated as an affine primitive, subject to checking

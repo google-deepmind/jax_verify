@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ Bound = bound_propagation.Bound
 Tensor = bound_propagation.Tensor
 Index = bound_propagation.Index
 Primitive = bound_propagation.Primitive
+InputBound = bound_propagation.InputBound
 TransformContext = bound_propagation.TransformContext
 SdpDualVerifInstance = utils.SdpDualVerifInstance
 
@@ -237,11 +238,9 @@ class _SdpTransform(bound_propagation.GraphTransform[SdpNode]):
   def input_transform(
       self,
       context: TransformContext,
-      lower_bound: Tensor,
-      upper_bound: Tensor,
+      input_bound: InputBound,
   ) -> SdpNode:
-    bound = self._boundprop_transform.input_transform(
-        context, lower_bound, upper_bound)
+    bound = self._boundprop_transform.input_transform(context, input_bound)
     return SdpNode(context.index, bound, True, None, lambda ys: None)
 
   def primitive_transform(

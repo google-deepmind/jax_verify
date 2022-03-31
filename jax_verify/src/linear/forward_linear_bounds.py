@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,18 +28,17 @@ from jax_verify.src import ibp
 from jax_verify.src import intersection
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
-from jax_verify.src.linear import linear_bound_utils
+from jax_verify.src.linear import linear_relaxations
 import numpy as np
 
 Bound = bound_propagation.Bound
 Index = graph_traversal.Index
 Tensor = jnp.ndarray
+InputBound = graph_traversal.InputBound
 Primitive = graph_traversal.Primitive
 TransformContext = graph_traversal.TransformContext
-LinFun = linear_bound_utils.LinFun
-LinearExpression = linear_bound_utils.LinearExpression
-
-EPSILON = 1e-5
+LinFun = linear_relaxations.LinFun
+LinearExpression = linear_relaxations.LinearExpression
 
 
 class RefBound:
@@ -502,7 +501,7 @@ def forward_crown_bound_propagation(function, *bounds):
     output_bound: Bounds on the output of the function obtained by FastLin
   """
   forward_crown_transform = ForwardLinearBoundTransform(
-      linear_bound_utils.crown_rvt_relaxer)
+      linear_relaxations.crown_rvt_relaxer)
   output_bound, _ = bound_propagation.bound_propagation(
       bound_propagation.ForwardPropagationAlgorithm(forward_crown_transform),
       function, *bounds)
@@ -531,7 +530,7 @@ class ForwardLinearBoundTransform(
     graph_traversal.GraphTransform[LinearBound]):
   """Propagate Linear bounds forward through the network."""
 
-  def __init__(self, relaxer: linear_bound_utils.LinearBoundsRelaxer,
+  def __init__(self, relaxer: linear_relaxations.LinearBoundsRelaxer,
                linear_elision: bool = False):
     self.relaxer = relaxer
     self._linear_elision = linear_elision
@@ -545,9 +544,9 @@ class ForwardLinearBoundTransform(
       return super().should_handle_as_subgraph(primitive)
 
   def input_transform(self, context: TransformContext,
-                      lower: Tensor,
-                      upper: Tensor) -> LinearBound:
-    return LinearBound.initial_linear_bound(context.index, lower, upper)
+                      input_bound: InputBound) -> LinearBound:
+    return LinearBound.initial_linear_bound(
+        context.index, input_bound.lower, input_bound.upper)
 
   def primitive_transform(self, context: TransformContext,
                           primitive: Primitive,
@@ -562,7 +561,7 @@ class ForwardLinearBoundTransform(
           or primitive in bound_propagation.RESHAPE_PRIMITIVES
           or (primitive is lax.div_p and isinstance(args[1], Tensor))):
       is_positive = primitive in POSLINEAR_PRIMITIVES
-      safe_params = utils.filter_jaxverify_kwargs(params)
+      safe_params = synthetic_primitives.filter_jaxverify_kwargs(params)
       lin_fun = utils.bind_nonbound_args(primitive.bind, *args, **safe_params)
       lin_bound_inputs = [arg.unwrap() for arg in args
                           if isinstance(arg, Bound)]
@@ -574,14 +573,19 @@ class ForwardLinearBoundTransform(
       # Obtain the linear bounds.
       lb_linfun, ub_linfun = self.relaxer.linearize_primitive(
           context.index, primitive, *args, **params)
+      # Translate to functions that only accept variable (linear bound) inputs.
+      lb_linfun = utils.bind_nonbound_args(lb_linfun, *args)
+      ub_linfun = utils.bind_nonbound_args(ub_linfun, *args)
       lin_bound_inputs = [arg.unwrap() for arg in args
                           if isinstance(arg, Bound)]
+
       is_positive = primitive in POSITIVE_RELAXATION_PRIMITIVES
       is_negative = primitive in NEGATIVE_RELAXATION_PRIMITIVES
 
       return _forward_propagate_linear_bounds(
           lb_linfun, ub_linfun, lin_bound_inputs,
           lin_is_positive=is_positive, lin_is_negative=is_negative)
+
 
 POSLINEAR_PRIMITIVES = [
     lax.scatter_add_p,
@@ -599,4 +603,4 @@ NEGATIVE_RELAXATION_PRIMITIVES = [
 ]
 
 forward_fastlin_transform = ForwardLinearBoundTransform(
-    linear_bound_utils.fastlin_rvt_relaxer)
+    linear_relaxations.fastlin_rvt_relaxer)

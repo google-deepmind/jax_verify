@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,8 +45,10 @@ NnCvx = TypeVar('NnCvx', bound='NonConvexBound')
 Tensor = jnp.ndarray
 Index = bound_propagation.Index
 TransformContext = bound_propagation.TransformContext
+InputBound = graph_traversal.InputBound
 Bound = bound_propagation.Bound
 BoundTransform = bound_propagation.BoundTransform
+Primitive = bound_propagation.Primitive
 # Mapping of a position in the computation to a set of parameters.
 # These can be variables, gradients, or coefficients.
 ParamSet = Dict[Index, Tensor]
@@ -246,7 +248,7 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
       cls: Type[NnCvx],
       index: Index,
       inp: NnCvx,
-      act_type: str,
+      act_type: Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor]) -> Callable[..., NnCvx]:
     """Class specific initialization for the output of a non-linearity."""
@@ -563,7 +565,7 @@ def _activation_convex_relaxation(
     bound_cls: Type[NnCvx],
     index: Index,
     inputs: List[NnCvx],
-    act_type: str,
+    act_type: Primitive,
     lb_fun: Callable[..., Tensor],
     ub_fun: Callable[..., Tensor],
     precomputed_bound: Optional[bound_propagation.Bound]) -> NnCvx:
@@ -613,12 +615,12 @@ def _activation_convex_relaxation(
 
 
 def _nonconvex_activation(
-    act_type: str,
+    act_type: Primitive,
     relaxation: Callable[..., Tuple[TensorFunction, TensorFunction]],
     bound_cls: Type[NnCvx],
     index: Index,
     *inps: Union[NnCvx, Tensor],
-    increasing: bool = False,
+    eltwise_increasing: bool = False,
     **params) -> NnCvx:
   """Propagation of NonConvexBounds through a non-linear operation.
 
@@ -629,15 +631,15 @@ def _nonconvex_activation(
     bound_cls: Bound class to use.
     index: Node index.
     *inps: Nonconvex bounds on the inputs to the operation.
-    increasing: Whether the operation is known to be monotonic increasing,
-      in which case we can pre-compute its bounds.
+    eltwise_increasing: Whether the operation is known to be element-wise
+      monotonic increasing, in which case we can pre-compute its bounds.
     **params: Parameters of the operation.
   Returns:
     out_bounds: Nonconvex bounds on the operation's output.
   """
   lb_fun, ub_fun = relaxation(*inps, **params)
 
-  if increasing:
+  if eltwise_increasing:
     # The function is assumed to be monotonically increasing, so we
     # can readily pre-compute interval bounds on its output.
     # `lb_fun` will be the original function whenever this is reached.
@@ -656,25 +658,14 @@ def _nonconvex_activation(
       act_type, lb_fun, ub_fun, precomputed_bound)
 
 
-_nonconvex_softplus = functools.partial(
-    _nonconvex_activation,
-    'Softplus', functools.partial(
-        activation_relaxation.convex_fn_relaxation,
-        synthetic_primitives.softplus_p),
-    increasing=True)
-
-
-_nonconvex_relu = functools.partial(
-    _nonconvex_activation,
-    'ReLU', functools.partial(
-        activation_relaxation.convex_fn_relaxation,
-        synthetic_primitives.relu_p),
-    increasing=True)
-
-
-_nonconvex_posbilinear = functools.partial(
-    _nonconvex_activation,
-    'BilinearValues', activation_relaxation.posbilinear_relaxation)
+def _make_activation_primitive_transform(
+    primitive: synthetic_primitives.PrimitiveLike,
+    activation: activation_relaxation.ActivationRelaxation,
+) -> Callable[..., NonConvexBound]:
+  return functools.partial(
+      _nonconvex_activation,
+      primitive, activation.relaxation_fn,
+      eltwise_increasing=activation.eltwise_increasing)
 
 
 _linear_op_primitives = (
@@ -686,9 +677,8 @@ _nonconvex_primitive_transform = {
     for primitive in _linear_op_primitives}
 _nonconvex_primitive_transform.update({
     lax.div_p: _nonconvex_div,
-    synthetic_primitives.relu_p: _nonconvex_relu,
-    synthetic_primitives.softplus_p: _nonconvex_softplus,
-    synthetic_primitives.posbilinear_p: _nonconvex_posbilinear,
+    **{primitive: _make_activation_primitive_transform(primitive, act)
+       for primitive, act in activation_relaxation.relaxation_fns.items()}
 })
 
 
@@ -711,11 +701,10 @@ class _NonConvexTransform(
   def input_transform(
       self,
       context: TransformContext,
-      lower_bound: Tensor,
-      upper_bound: Tensor,
+      input_bound: InputBound,
   ) -> NnCvx:
     return self._bound_cls.initial_nonconvex_bound(
-        context.index, lower_bound, upper_bound)
+        context.index, input_bound.lower, input_bound.upper)
 
   def primitive_transform(
       self,
@@ -728,7 +717,7 @@ class _NonConvexTransform(
       if (isinstance(arg, NonConvexBound) and
           arg.requires_concretizing(primitive)):
         arg.concretize(self._concretizer, self._graph, self._env)
-    params = utils.filter_jaxverify_kwargs(params)
+    params = synthetic_primitives.filter_jaxverify_kwargs(params)
     new_bound = _nonconvex_primitive_transform[primitive](
         self._bound_cls, context.index, *args, **params)
     return new_bound
@@ -752,12 +741,11 @@ class _ConstrainedNonConvexTransform(
   def input_transform(
       self,
       context: TransformContext,
-      lower_bound: Tensor,
-      upper_bound: Tensor,
+      input_bound: InputBound,
   ) -> ConstrainedNonConvexBound:
-    bound = super().input_transform(context, lower_bound, upper_bound)
+    bound = super().input_transform(context, input_bound)
     bound.set_imposed_bounds(self._imposed_boundprop.input_transform(
-        context, lower_bound, upper_bound))
+        context, input_bound))
     return bound
 
   def primitive_transform(

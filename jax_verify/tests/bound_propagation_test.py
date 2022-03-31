@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -178,6 +178,7 @@ class BoundPropagationTest(parameterized.TestCase):
 
     @jax.jit
     def bound_prop_fun(inp_bound):
+      inp_bound, = bound_propagation.unjit_inputs(inp_bound)
       bounds = jax_verify.interval_bound_propagation(fun_to_prop, inp_bound)
       return bounds.lower, bounds.upper
 

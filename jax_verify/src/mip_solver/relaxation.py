@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ from typing import Callable, Tuple, Dict, Union, List, Optional
 import jax
 from jax import lax
 import jax.numpy as jnp
+from jax_verify.src import activation_relaxation
 from jax_verify.src import bound_propagation
 from jax_verify.src import ibp
 from jax_verify.src import synthetic_primitives
@@ -438,31 +439,22 @@ def _get_linear(primitive, outval, *eqn_invars, **params):
   # TODO: Replace with something more efficient
   for i in range(outval.size):
     fung = functools.partial(fungrad, i)
-    bias, current_grad = jax.value_and_grad(fung)(
+    bias, current_grad = jax.value_and_grad(fung, allow_int=True)(
         [funx(x) for x in eqn_invars])
     coefficients = []
-    for res in current_grad:
-      components = jnp.flatnonzero(res)
-      coefficients.append((components, res.ravel()[components]))
+    for res, in_var in zip(current_grad, eqn_invars):
+      if isinstance(in_var, RelaxVariable):
+        components = jnp.flatnonzero(res)
+        coefficients.append((components, res.ravel()[components]))
+      else:
+        coefficients.append(None)
     results.append((bias, coefficients))
   return results
 
 
-def _get_relu_relax(lower, upper):
-  """Upper chord of triangle relu relaxation."""
-  on = lower >= 0.
-  amb = jnp.logical_and(lower < 0., upper > 0.)
-  slope = jnp.where(on, jnp.ones_like(lower), jnp.zeros_like(lower))
-  slope += jnp.where(amb, upper/jnp.maximum(upper-lower, 1e-12),
-                     jnp.zeros_like(lower))
-  bias = jnp.where(amb, -lower * upper/jnp.maximum(upper-lower, 1e-12),
-                   jnp.zeros_like(lower))
-  return slope, bias
-
-
 def _relax_input(
     index: bound_propagation.Index, in_bounds: bound_propagation.Bound,
-    ) -> RelaxVariable:
+) -> RelaxVariable:
   """Generates the initial inputs for the relaxation.
 
   Args:
@@ -482,7 +474,6 @@ _affine_primitives_list = (
     bound_propagation.RESHAPE_PRIMITIVES +
     [lax.div_p]
 )
-_activation_list = [synthetic_primitives.relu_p]
 
 
 def _relax_primitive(
@@ -531,51 +522,53 @@ def _relax_primitive(
       out_coeff = (np.array([i], dtype=np.int64), np.array([-1.]))
       vars_and_coeffs.append((out_variable, out_coeff))
       constraints.append(LinearConstraint(vars_and_coeffs, bias, 0))
-  elif primitive in _activation_list:
-    # Generate relu relaxation
-    invar = args[0]
-    slope, bias = _get_relu_relax(invar.lower, invar.upper)
-    relu_on = invar.lower >= 0
-    relu_off = invar.upper <= 0
-    relu_ambiguous = jnp.logical_and(jnp.logical_not(relu_on),
-                                     jnp.logical_not(relu_off))
-    constraints += [
-        # relu(x) = 0 if relu_off
-        RelaxActivationConstraint(outvar=out_variable,
-                                  invar=invar,
-                                  mask=relu_off,
-                                  scale=jnp.zeros_like(invar.lower),
-                                  bias=jnp.zeros_like(invar.lower),
-                                  sense=0),
-        # relu(x) = x if relu_on
-        RelaxActivationConstraint(outvar=out_variable,
-                                  invar=invar,
-                                  mask=relu_on,
-                                  scale=jnp.ones_like(invar.lower),
-                                  bias=jnp.zeros_like(invar.lower),
-                                  sense=0),
-        # relu(x) >= 0 if relu_ambiguous
-        RelaxActivationConstraint(outvar=out_variable,
-                                  invar=invar,
-                                  mask=relu_ambiguous,
-                                  scale=jnp.zeros_like(invar.lower),
-                                  bias=jnp.zeros_like(invar.lower),
-                                  sense=1),
-        # relu(x) >= x if relu_ambiguous
-        RelaxActivationConstraint(outvar=out_variable,
-                                  invar=invar,
-                                  mask=relu_ambiguous,
-                                  scale=jnp.ones_like(invar.lower),
-                                  bias=jnp.zeros_like(invar.lower),
-                                  sense=1),
-        # upper chord of triangle relax if relu_ambiguous
-        RelaxActivationConstraint(outvar=out_variable,
-                                  invar=invar,
-                                  mask=relu_ambiguous,
-                                  scale=slope,
-                                  bias=bias,
-                                  sense=-1)]
+  elif primitive in activation_relaxation.relaxation_fns:
+    # Generate convex relaxation.
+    safe_kwargs = synthetic_primitives.filter_jaxverify_kwargs(kwargs)
+    activation = activation_relaxation.relaxation_fns[primitive]
+    lb_funs, ub_funs = activation.piecewise_linear_relaxation_fn(*args,
+                                                                 **safe_kwargs)
+    invar, = args
+    zeros = jnp.zeros_like(invar.lower)
+    ones = jnp.ones_like(invar.lower)
+    if activation.pos_neg_linear and (len(lb_funs) == 1 or len(ub_funs) == 1):
+      # Use equality constraints if linear over the entire interval.
+      ambiguous = (invar.lower < 0) & (invar.upper > 0)
+      chord, = lb_funs if len(lb_funs) == 1 else ub_funs
+      constraints.append(RelaxActivationConstraint(
+          outvar=out_variable,
+          invar=invar,
+          mask=(~ambiguous),
+          scale=(chord(ones) - chord(zeros)),
+          bias=chord(zeros),
+          sense=0))
+    else:
+      ambiguous = ones
+
+    for lb_fun in lb_funs:
+      # act(x) >= lb(x)
+      constraints.append(RelaxActivationConstraint(
+          outvar=out_variable,
+          invar=invar,
+          mask=ambiguous,
+          scale=(lb_fun(ones) - lb_fun(zeros)),
+          bias=lb_fun(zeros),
+          sense=1))
+
+    for ub_fun in ub_funs:
+      # act(x) <= ub(x)
+      constraints.append(RelaxActivationConstraint(
+          outvar=out_variable,
+          invar=invar,
+          mask=ambiguous,
+          scale=(ub_fun(ones) - ub_fun(zeros)),
+          bias=ub_fun(zeros),
+          sense=-1))
+
     if use_mip:
+      if primitive is not synthetic_primitives.relu_p:
+        raise ValueError(
+            f'Only ReLU activations supported. Encountered {primitive}')
       binvar = BinaryVariable(index, out_bounds.lower.shape)
       constraints += [
           # outvar <= upper_bound * binvar
@@ -583,17 +576,17 @@ def _relax_primitive(
                                   invar=invar,
                                   binvar=binvar,
                                   binscale=invar.upper,
-                                  mask=relu_ambiguous,
-                                  scale=jnp.zeros_like(invar.lower),
-                                  bias=jnp.zeros_like(invar.lower),
+                                  mask=ambiguous,
+                                  scale=zeros,
+                                  bias=zeros,
                                   sense=-1),
           # outvar <= invar - lower_bound * (1. - binvar)
           MIPActivationConstraint(outvar=out_variable,
                                   invar=invar,
                                   binvar=binvar,
                                   binscale=invar.lower,
-                                  mask=relu_ambiguous,
-                                  scale=jnp.ones_like(invar.lower),
+                                  mask=ambiguous,
+                                  scale=ones,
                                   bias=-invar.lower,
                                   sense=-1),
       ]
@@ -611,7 +604,7 @@ class RelaxationTransform(bound_propagation.GraphTransform[RelaxVariable]):
       self,
       boundprop_transform: bound_propagation.BoundTransform,
       use_mip: bool = False,
-      ):
+  ):
     """Defines relaxation constraint propagation.
 
     Args:
@@ -623,9 +616,9 @@ class RelaxationTransform(bound_propagation.GraphTransform[RelaxVariable]):
     self._boundprop_transform = boundprop_transform
     self._use_mip = use_mip
 
-  def input_transform(self, context, lower_bound, upper_bound):
+  def input_transform(self, context, input_bound):
     in_bounds = self._boundprop_transform.input_transform(
-        context, lower_bound, upper_bound)
+        context, input_bound)
     return _relax_input(context.index, in_bounds)
 
   def primitive_transform(self, context, primitive, *args, **params):
@@ -688,11 +681,10 @@ class OptimizedRelaxationTransform(
   def input_transform(
       self,
       context: bound_propagation.TransformContext,
-      lower_bound: Tensor,
-      upper_bound: Tensor,
+      input_bound: bound_propagation.InputBound,
   ) -> RelaxVariable:
     in_bounds = self._transform.input_transform(
-        context, lower_bound, upper_bound)
+        context, input_bound)
     for minibatch_index in range(in_bounds.shape[0]):
       # Create one solver instance for each problem in the batch because they
       # will have different constraints.

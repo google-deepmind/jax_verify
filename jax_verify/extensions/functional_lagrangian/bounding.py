@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -302,7 +302,7 @@ class BoundsFromCnn(bound_propagation.BoundTransform):
     self._cnn_bounds = bounds
     self._cnn_layer_indices = {}
 
-  def input_transform(self, context, lower_bound, upper_bound):
+  def input_transform(self, context, input_bound):
     if context.index not in self._cnn_layer_indices:
       self._cnn_layer_indices[context.index] = 0, False
     return self._bounds_from_cnn_layer(context.index)

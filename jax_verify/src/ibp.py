@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 """Implementation of Interval Bound Propagation.
 """
 import functools
-from typing import Union, Tuple
+from typing import Tuple
 
 import jax
 from jax import lax
@@ -24,10 +24,9 @@ import jax.numpy as jnp
 
 from jax_verify.src import bound_propagation
 from jax_verify.src import synthetic_primitives
-from jax_verify.src import utils
 
 Tensor = jnp.ndarray
-PrimitiveInput = Union[Tensor, bound_propagation.Bound]
+LayerInput = bound_propagation.LayerInput
 IntervalBound = bound_propagation.IntervalBound
 
 
@@ -40,7 +39,7 @@ def _make_ibp_passthrough_primitive(primitive: jax.core.Primitive):
     ibp_primitive: Function applying transparently the primitive to both
       upper and lower bounds.
   """
-  def ibp_primitive(*args: PrimitiveInput, **kwargs) -> IntervalBound:
+  def ibp_primitive(*args: LayerInput, **kwargs) -> IntervalBound:
     # We assume that one version should be called with all the 'lower' bound and
     # one with the upper bound. If there is some argument that is not a bound,
     # we assumed it's just simple parameters and pass them through.
@@ -55,7 +54,7 @@ def _make_ibp_passthrough_primitive(primitive: jax.core.Primitive):
   return ibp_primitive
 
 
-def _decompose_affine_argument(hs: PrimitiveInput) -> Tuple[Tensor, Tensor]:
+def _decompose_affine_argument(hs: LayerInput) -> Tuple[Tensor, Tensor]:
   """Decompose an argument for a (bound, parameter) IBP propagation.
 
   We do not need to know which argument is the bound and which one is the
@@ -83,9 +82,9 @@ def _decompose_affine_argument(hs: PrimitiveInput) -> Tuple[Tensor, Tensor]:
 
 def _ibp_bilinear(
     primitive: jax.core.Primitive,
-    lhs: PrimitiveInput,
-    rhs: PrimitiveInput,
-    **kwargs) -> PrimitiveInput:
+    lhs: LayerInput,
+    rhs: LayerInput,
+    **kwargs) -> LayerInput:
   """Propagation of IBP bounds through a bilinear primitive (product, conv).
 
   We don't know if the bound is on the left or right hand side, but we expect
@@ -286,7 +285,7 @@ def _ibp_dotgeneral_bilinear(lhs: bound_propagation.Bound,
   return IntervalBound(lower, upper)
 
 
-def _ibp_div(lhs: PrimitiveInput, rhs: Tensor) -> PrimitiveInput:
+def _ibp_div(lhs: LayerInput, rhs: Tensor) -> LayerInput:
   """Propagation of IBP bounds through Elementwise division.
 
   We don't support the propagation of bounds through the denominator.
@@ -302,7 +301,7 @@ def _ibp_div(lhs: PrimitiveInput, rhs: Tensor) -> PrimitiveInput:
   return _ibp_bilinear(lax.mul_p, lhs, 1. / rhs)
 
 
-def _ibp_add(lhs: PrimitiveInput, rhs: PrimitiveInput) -> IntervalBound:
+def _ibp_add(lhs: LayerInput, rhs: LayerInput) -> IntervalBound:
   """Propagation of IBP bounds through an addition.
 
   Args:
@@ -321,7 +320,7 @@ def _ibp_add(lhs: PrimitiveInput, rhs: PrimitiveInput) -> IntervalBound:
     return IntervalBound(rhs.lower + lhs, rhs.upper + lhs)
 
 
-def _ibp_sub(lhs: PrimitiveInput, rhs: PrimitiveInput) -> IntervalBound:
+def _ibp_sub(lhs: LayerInput, rhs: LayerInput) -> IntervalBound:
   """Propagation of IBP bounds through a substraction.
 
   Args:
@@ -340,7 +339,7 @@ def _ibp_sub(lhs: PrimitiveInput, rhs: PrimitiveInput) -> IntervalBound:
     return IntervalBound(lhs - rhs.upper, lhs - rhs.lower)
 
 
-def _ibp_softmax(logits: PrimitiveInput, axis) -> IntervalBound:
+def _ibp_softmax(logits: LayerInput, axis) -> IntervalBound:
   """Propagation of IBP bounds through softmax.
 
   Args:
@@ -400,7 +399,7 @@ def _ibp_leaky_relu(x: IntervalBound, negative_slope: float) -> IntervalBound:
                        jax.nn.leaky_relu(x.upper, negative_slope))
 
 
-def _ibp_integer_pow(x: PrimitiveInput, y: int) -> IntervalBound:
+def _ibp_integer_pow(x: LayerInput, y: int) -> IntervalBound:
   """Propagation of IBP bounds through integer_pow.
 
   Args:
@@ -428,7 +427,7 @@ def _ibp_integer_pow(x: PrimitiveInput, y: int) -> IntervalBound:
     return IntervalBound(l_pow, u_pow)
 
 
-def _ibp_reciprocal(x: PrimitiveInput) -> IntervalBound:
+def _ibp_reciprocal(x: LayerInput) -> IntervalBound:
   """Propagation of IBP bounds through reciprocal, assuming positive input.
 
   Args:
@@ -441,7 +440,7 @@ def _ibp_reciprocal(x: PrimitiveInput) -> IntervalBound:
 
 
 # Define the mapping from jaxpr primitive to the IBP version.
-_input_transform = utils.simple_propagation(IntervalBound)
+_input_transform = lambda x: IntervalBound(x.lower, x.upper)
 _primitives_to_passthrough = bound_propagation.RESHAPE_PRIMITIVES + [
     lax.reduce_sum_p,
     lax.max_p,
@@ -469,8 +468,6 @@ _primitive_transform.update({
     synthetic_primitives.softmax_p: _ibp_softmax,
     synthetic_primitives.posreciprocal_p: _ibp_reciprocal,
 })
-_primitive_transform = {key: utils.simple_propagation(prop_fun)
-                        for key, prop_fun in _primitive_transform.items()}
 bound_transform = bound_propagation.OpwiseGraphTransform(
     _input_transform, _primitive_transform)
 

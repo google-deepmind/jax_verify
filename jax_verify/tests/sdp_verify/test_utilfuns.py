@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,8 @@ class ParamExtractionTest(parameterized.TestCase):
     eval_original = fun_to_extract(example_inputs)
     eval_extracted = utils.predict_cnn(extracted_params, example_inputs)
 
-    self.assertAlmostEqual(jnp.abs(eval_original - eval_extracted).max(), 0.0)
+    self.assertAlmostEqual(jnp.abs(eval_original - eval_extracted).max(), 0.0,
+                           places=6)
 
   def test_cnn_extract(self):
     """Test that weights from a CNN can be extracted."""

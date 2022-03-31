@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,16 +27,16 @@ import jax.numpy as jnp
 import jax_verify
 from jax_verify.src import bound_propagation
 from jax_verify.src.linear import forward_linear_bounds
-from jax_verify.src.linear import linear_bound_utils
+from jax_verify.src.linear import linear_relaxations
 from jax_verify.tests import test_utils
 
 
 def get_boundprop(name: str, elision: bool
                   ) -> Callable[..., forward_linear_bounds.LinearBound]:
   if name == 'fastlin':
-    relaxer = linear_bound_utils.fastlin_rvt_relaxer
+    relaxer = linear_relaxations.fastlin_rvt_relaxer
   elif name == 'crown':
-    relaxer = linear_bound_utils.crown_rvt_relaxer
+    relaxer = linear_relaxations.crown_rvt_relaxer
 
   transform = forward_linear_bounds.ForwardLinearBoundTransform(
       relaxer, elision)

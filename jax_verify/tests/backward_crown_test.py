@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,9 +26,11 @@ import jax.numpy as jnp
 import jax_verify
 
 from jax_verify.src import bound_propagation
-from jax_verify.src import bound_utils
+from jax_verify.src import concretization
+from jax_verify.src import ibp
+from jax_verify.src import optimizers
 from jax_verify.src.linear import backward_crown
-from jax_verify.src.linear import linear_bound_utils
+from jax_verify.src.linear import linear_relaxations
 from jax_verify.tests import test_utils
 
 import numpy as np
@@ -240,22 +242,73 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     sample_value = jnp.array([-1., 1.])
     inp_bound = jax_verify.IntervalBound(sample_value, sample_value)
 
-    concretizer = backward_crown.ChunkedBackwardConcretizer(
-        backward_crown.OptimizingLinearBoundBackwardTransform(
-            linear_bound_utils.parameterized_relaxer,
-            backward_crown.CONCRETIZE_ARGS_PRIMITIVE,
-            optax.adam(1.e-3), num_opt_steps=10))
+    optimizer = optimizers.OptaxOptimizer(optax.adam(1e-3), num_steps=10)
 
-    algorithm = bound_utils.BackwardConcretizingAlgorithm(concretizer)
+    concretizer = concretization.ChunkedBackwardConcretizer(
+        backward_crown.OptimizingLinearBoundBackwardTransform(
+            linear_relaxations.parameterized_relaxer,
+            backward_crown.CONCRETIZE_ARGS_PRIMITIVE,
+            optimizer))
+
+    algorithm = concretization.BackwardConcretizingAlgorithm(concretizer)
     bound, _ = bound_propagation.bound_propagation(
         algorithm, model, inp_bound)
 
     np.testing.assert_array_almost_equal(bound.lower, bound.upper)
 
+  def test_forwardconcretization_withbackwardalg_reference_out(self):
+    architecture = [2, 4, 4, 2]
+    problem_key = jax.random.PRNGKey(42)
+    fun, (lb, ub) = test_utils.set_up_toy_problem(problem_key, 2,
+                                                  architecture)
+    def model_fun(inp):
+      out = fun(inp)
+      select = jnp.array([[True, False]])
+      # We are causing the last operation to be a select, to force it to be a
+      # reference.
+      return jnp.where(select, out, -1.* out)
+
+    inp_bound = jax_verify.IntervalBound(lb, ub)
+
+    optimizer = optimizers.OptaxOptimizer(optax.adam(1e-3), num_steps=10)
+    concretizer = concretization.ChunkedBackwardConcretizer(
+        backward_crown.OptimizingLinearBoundBackwardTransform(
+            linear_relaxations.parameterized_relaxer,
+            backward_crown.CONCRETIZE_ARGS_PRIMITIVE,
+            optimizer))
+
+    algorithm = concretization.BackwardAlgorithmForwardConcretization(
+        ibp.bound_transform, concretizer)
+
+    # This used to cause an exception as the backward discovery of nodes
+    # needing relaxation was not working. The Scanner was not being
+    # propagated backwards.
+    bound_propagation.bound_propagation(algorithm, model_fun, inp_bound)
+
+  def test_keyword_and_flat_params(self):
+    def model_fun(p_dict, a):
+      elt_1 = p_dict['elt_1']
+      elt_2 = p_dict['elt_2']
+
+      interm = jax.nn.relu(elt_1 @ elt_2)
+
+      return jnp.sum(interm + a)
+
+    p_dict = {'elt_1': jnp.ones((2, 10)),
+              'elt_2': jax_verify.IntervalBound(jnp.zeros((10, 2)),
+                                                jnp.ones((10, 2)))}
+    a = jax_verify.IntervalBound(jnp.zeros((2, 2)),
+                                 jnp.ones((2, 2)))
+
+    # This used to cause an exception due to a bug in the implementation
+    # of concretization.BackwardConcretizationAlgorithm, when the inputs bound
+    # get filled in the backward_env.
+    backward_crown.backward_crown_bound_propagation(model_fun, p_dict, a)
+
   @parameterized.named_parameters(
-      ('crown', linear_bound_utils.crown_rvt_relaxer),
-      ('fastlin', linear_bound_utils.fastlin_rvt_relaxer),
-      ('parameterized', linear_bound_utils.parameterized_relaxer),
+      ('crown', linear_relaxations.crown_rvt_relaxer),
+      ('fastlin', linear_relaxations.fastlin_rvt_relaxer),
+      ('parameterized', linear_relaxations.parameterized_relaxer),
   )
   def test_chunking(self, relaxer):
     batch_size = 3
@@ -283,23 +336,24 @@ class BackwardCrownBoundTest(parameterized.TestCase):
       final = act @ final_lay_weight
       return final
 
-    if isinstance(relaxer, linear_bound_utils.ParameterizedLinearBoundsRelaxer):
+    if isinstance(relaxer, linear_relaxations.ParameterizedLinearBoundsRelaxer):
+      optimizer = optimizers.OptaxOptimizer(optax.adam(1e-3), num_steps=10)
       concretizing_transform = (
           backward_crown.OptimizingLinearBoundBackwardTransform(
               relaxer, backward_crown.CONCRETIZE_ARGS_PRIMITIVE,
-              optax.adam(1.e-3), num_opt_steps=10))
+              optimizer))
     else:
       concretizing_transform = backward_crown.LinearBoundBackwardTransform(
           relaxer, backward_crown.CONCRETIZE_ARGS_PRIMITIVE)
 
-    chunked_concretizer = backward_crown.ChunkedBackwardConcretizer(
+    chunked_concretizer = concretization.ChunkedBackwardConcretizer(
         concretizing_transform, max_chunk_size=16)
-    unchunked_concretizer = backward_crown.ChunkedBackwardConcretizer(
+    unchunked_concretizer = concretization.ChunkedBackwardConcretizer(
         concretizing_transform, max_chunk_size=0)
 
-    chunked_algorithm = bound_utils.BackwardConcretizingAlgorithm(
+    chunked_algorithm = concretization.BackwardConcretizingAlgorithm(
         chunked_concretizer)
-    unchunked_algorithm = bound_utils.BackwardConcretizingAlgorithm(
+    unchunked_algorithm = concretization.BackwardConcretizingAlgorithm(
         unchunked_concretizer)
 
     chunked_bound, _ = bound_propagation.bound_propagation(

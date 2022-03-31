@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 """
 
 import abc
+import functools
 from typing import Tuple, Callable, Dict, Optional, List, Union
 
 import jax
@@ -24,6 +25,7 @@ import jax.numpy as jnp
 
 from jax_verify.src import bound_propagation
 from jax_verify.src import ibp
+from jax_verify.src import optimizers
 from jax_verify.src import utils
 from jax_verify.src.nonconvex import nonconvex
 import optax
@@ -278,38 +280,8 @@ def _unpack_opt_problem(dual_vals: Tensor) -> Tuple[Tensor, Tensor]:
   return lb_duals, -ub_duals
 
 
-def _pgd_step(current: ParamSet,
-              grad: ParamSet,
-              step_size: Tensor) -> ParamSet:
-  """Do a projected gradient step with the given step size."""
-  new_varset = {}
-  for key, var in current.items():
-    var_grad = grad[key]
-    nb_act_dims = len(var.shape) - len(step_size.shape)
-    broad_step_size = jnp.reshape(step_size,
-                                  step_size.shape + (1,)*nb_act_dims)
-    new_varset[key] = jnp.clip(var + broad_step_size * var_grad, 0., 1.)
-  return new_varset
-
-
 class LinesearchFistaOptimizer(BoundOptimizer):
-  """FISTA with line search.
-
-  As done in the "An efficient nonconvex reformulation of stagewise convex
-  optimization problems" NeurIPS2020 submission. This is a reimplementation
-  of the code at:
-  l/d/r/r_v/verification/ibp/verification/nonconvex_optimizable_bounds.py
-
-  The difference between the two versions of the code is that this
-  implementation performs minimization while the other one performed
-  maximization. This difference is visible in the following places:
-    - Changes the formula of the quadratic approximation (sign before
-      the L2 norm term).
-    - Direction of the comparison for the line search.
-    - Direction of the step.
-    - Direction of the dual gap (when minimizing, it is primal - dual, while
-      it is dual - primal when maximizing) to check for convergence.
-  """
+  """FISTA with line search."""
 
   def __init__(self,
                num_steps: int,
@@ -320,12 +292,9 @@ class LinesearchFistaOptimizer(BoundOptimizer):
                check_convergence_every: int = 1,
                check_relative_dual_gap: bool = False,
                termination_dual_gap: float = 1e-2):
-    self._num_steps = num_steps
-    self._max_step_size = max_step_size
-    self._min_step_size = min_step_size
-    self._beta_l = beta_l
-    self._beta_h = beta_h
-    self._check_convergence_every = check_convergence_every
+    self._optimizer = optimizers.LinesearchFistaOptimizer(
+        num_steps, max_step_size, min_step_size,
+        beta_l, beta_h, check_convergence_every)
     self._check_relative_dual_gap = check_relative_dual_gap
     self._termination_dual_gap = termination_dual_gap
 
@@ -338,150 +307,45 @@ class LinesearchFistaOptimizer(BoundOptimizer):
     Returns:
       optimize: Optimization function.
     """
-    ## Define the functions for the backtracking line search
-    # We have a separate optimization per optimization target (so one per batch
-    # element times per neuron).
-    # This will be performed in jax.lax.while_loop, with the following arguments
-    # ls_loop_args:
-    #   need_lower: Boolean array indicating for each step_size if we still
-    #     needs to lower the step size.
-    #   step_size: Array of step size being used.
-    #   y_stats: Tuple with y, f(y) and grad(y), so that we don't have to keep
-    #     recomputing it.
-    #   objectives: Coefficients of the objective functions.
-    def quad_approx(x: ParamSet,
-                    y: ParamSet,
-                    grad_y: ParamSet,
-                    step_size: Tensor) -> Tensor:
-      quad_approx = 0
-      for key, x_var in x.items():
-        y_var = y[key]
-        grady_var = grad_y[key]
-        dims_to_reduce = tuple(range(1, y_var.ndim))
-        quad_approx = quad_approx + (
-            ((x_var - y_var)*grady_var).sum(axis=dims_to_reduce)
-            + 0.5 / step_size * ((x_var - y_var)**2).sum(axis=dims_to_reduce))
-      return quad_approx
 
-    def should_decrease(step_size: Tensor,
-                        y_stats: Tuple[ParamSet, Tensor, ParamSet],
-                        objectives: ParamSet) -> Tensor:
-      y, f_y, grad_y = y_stats
-      new_x = _pgd_step(y, grad_y, -step_size)
-      val_newx, _ = non_convex_bound.primal_fn(new_x, objectives)
-      val_qapprox = f_y + quad_approx(new_x, y, grad_y, step_size)
-      per_sp_insufficient_progress = (val_newx >= val_qapprox)
-      step_size_not_min = step_size > self._min_step_size
-      return jnp.logical_and(step_size_not_min, per_sp_insufficient_progress)
+    def fun_to_opt(objectives, opt_vars):
+      """Target functions to minimize.
 
-    def lower_stepsize_if_needed(
-        ls_loop_args:
-        Tuple[Tensor, Tensor, Tuple[ParamSet, Tensor, ParamSet], ParamSet],
-    ) -> Tuple[Tensor, Tensor, Tuple[ParamSet, Tensor, ParamSet], ParamSet]:
-      """Reduce the step size for all the optimization target that need it.
-
-      Update the check to see if it needs to be reduced further.
+      The functions to minimize are the primal objectives, given
+      by non_convex_bound.primal function. This function also returns the
+      intermediate activation as an auxiliary output, which we want to
+      ignore.
 
       Args:
-        ls_loop_args: Line search loop arguments
+        objectives: Linear coefficients of the objective function on the
+          activations.
+        opt_vars: Value of the parameters to evaluate.
       Returns:
-        new_ls_loop_args: Updated line search loop arguments
+        obj: sum of the objective functions.
       """
-      need_lower, step_size, y_stats, objectives = ls_loop_args
-      new_step_size = jnp.where(need_lower,
-                                self._beta_l * step_size, step_size)
-      new_need_lower = should_decrease(new_step_size, y_stats, objectives)
-      return (new_need_lower, new_step_size, y_stats, objectives)
+      obj, _ = non_convex_bound.primal_fn(opt_vars, objectives)
+      return obj
 
-    any_need_lower_stepsize = lambda ls_loop_args: ls_loop_args[0].any()
+    proj_fun = lambda opt_var: jnp.clip(opt_var, 0., 1.)
+    project_all_params = lambda opt_vars: jax.tree_map(proj_fun, opt_vars)
 
-    ## Define the function for the optimization loop
-    # Perform the Fista with backtracking line search algorithm, as described
-    # in "A Fast Iterative Shrinkage-Thresholding Algorithm", Beck and Teboulle
-    # The only change is that we increase the step size by a factor of
-    # self._beta_h for step size that didn't need to be reduced at all during
-    # the linesearch.
-    # This is performed in a jax.lax.while_loop, with the following arguments:
-    # opt_loop_args:
-    #   it: Iteration counter
-    #   x, y: variable set
-    #   gamma: float, coefficient used for the momentum (t_k in the paper)
-    #   step_size: Array containing the current values of the step size.
-    #   objectives: Coefficients of the objective functions.
-    # We stop either based on a maximum number of iterations, or based on the
-    # convergence between the primal objective and the dual objective, which is
-    # checked every self._check_convergence_every iterations.
-    def fista_with_linesearch_step(
-        opt_loop_args: Tuple[int, ParamSet, ParamSet, Tensor, Tensor, ParamSet],
-    ) -> Tuple[int, ParamSet, ParamSet, Tensor, Tensor, ParamSet]:
-      it, x, y, gamma, step_size, objectives = opt_loop_args
-      # Compute f_y and d(f_y)/d(y)
-      value_and_gradofsum_fn = jax.value_and_grad(non_convex_bound.primal_sumfn,
-                                                  has_aux=True)
-      (_, (f_y, _)), grad_y = value_and_gradofsum_fn(y, objectives)
-
-      # Compute the step size to use with a line search
-      y_stats = (y, f_y, grad_y)
-      ini_need_lower = should_decrease(step_size, y_stats, objectives)
-      _, new_step_size, _, _ = jax.lax.while_loop(
-          any_need_lower_stepsize,
-          lower_stepsize_if_needed,
-          (ini_need_lower, step_size, y_stats, objectives))
-
-      # Perform the updates
-      new_x = _pgd_step(y, grad_y, -new_step_size)
-      new_gamma = 1 + jnp.sqrt(1 + gamma ** 2) / 2
-      coeff = (gamma - 1) / new_gamma
-
-      new_y = {}
-      for key, new_x_var in new_x.items():
-        new_y[key] = new_x_var + coeff * (new_x_var - x[key])
-
-      # Increase the step size of the samples that didn't need reducing.
-      new_step_size = jnp.where(ini_need_lower,
-                                new_step_size, self._beta_h * new_step_size)
-
-      return it + 1, new_x, new_y, new_gamma, new_step_size, objectives
-
-    def not_all_converged(not_converged_args: Tuple[ParamSet, ParamSet],
-                          ) -> bool:
-      x, objectives = not_converged_args
-      primal, dual = non_convex_bound.dual(x, objectives)
+    def any_not_done(objectives, opt_vars):
+      primal, dual = non_convex_bound.dual(opt_vars, objectives)
       dgap_value = primal - dual
       if self._check_relative_dual_gap:
         bound_scale = 0.5 * (jnp.abs(primal) + jnp.abs(dual))
         termination_gap = (1 + bound_scale) * self._termination_dual_gap
       else:
         termination_gap = self._termination_dual_gap
-
       return (dgap_value > termination_gap).any()
 
-    def continue_criterion(
-        opt_loop_args: Tuple[int, ParamSet, ParamSet, Tensor, Tensor, ParamSet],
-    ) -> Tensor:
-      it, x, *_, objectives = opt_loop_args
-      not_all_iterations = (it < self._num_steps)
-      opt_not_converged = jax.lax.cond(
-          (it % self._check_convergence_every) == 0.,
-          not_all_converged,
-          lambda _: jnp.array(True),
-          operand=(x, objectives))
-      return jnp.logical_and(opt_not_converged, not_all_iterations)
+    def optimize(objectives: ParamSet, var_set: ParamSet) -> ParamSet:
+      obj_fun = functools.partial(fun_to_opt, objectives)
+      not_conv_fun = functools.partial(any_not_done, objectives)
 
-    ## Define the function to optimize a chunk of the nodes of the activation.
-    def optimize(objectives: ParamSet, x: ParamSet) -> ParamSet:
-      y = x
-      target_dims = objectives[non_convex_bound.index].shape[0]
-      gamma = jnp.array(0.)
-      step_size = self._max_step_size * jnp.ones(target_dims)
-      it = jnp.array(0)
-
-      _, final_x, _, _, _, _ = jax.lax.while_loop(
-          continue_criterion,
-          fista_with_linesearch_step,
-          (it, x, y, gamma, step_size, objectives))
-
-      return final_x
+      opt_fun = self._optimizer.optimize_fn(obj_fun, project_all_params,
+                                            not_conv_fun)
+      return opt_fun(var_set)
 
     return optimize
 
@@ -498,8 +362,11 @@ class PGDOptimizer(BoundOptimizer):
 
   def __init__(self, num_steps: int, step_size: float,
                optimize_dual: bool = False):
-    self._num_steps = num_steps
-    self._step_size = step_size
+    # Define the optimizer. Because we are minimizing the objective function,
+    # we will scale the gradient by a negative step size.
+    gradient_transform = optax.scale(-step_size)
+    self._optimizer = optimizers.OptaxOptimizer(
+        gradient_transform, num_steps=num_steps)
     self._optimize_dual = optimize_dual
 
   def optimize_fun(self, non_convex_bound: nonconvex.NonConvexBound,
@@ -514,39 +381,20 @@ class PGDOptimizer(BoundOptimizer):
     # If we are going to actually perform optimization, define the function to
     # minimize (either the primal, or the negative of the dual),
     # its gradient and the projection function to use.
-    if self._num_steps:
-      def fun_to_opt(opt_vars, objectives):
-        if self._optimize_dual:
-          _, dual_vals = non_convex_bound.dual(opt_vars, objectives)
-          obj = -jnp.sum(dual_vals)
-        else:
-          obj, _ = non_convex_bound.primal_sumfn(opt_vars, objectives)
-        return obj
-      grad_fun = jax.grad(fun_to_opt)
-      proj_fun = lambda x: jnp.clip(x, 0., 1.)
-
-      # Define the optimizer. Because we are minimizing the objective function,
-      # we will scale the gradient by a negative step size.
-      tx = optax.scale(-self._step_size)
+    def fun_to_opt(opt_vars, objectives):
+      if self._optimize_dual:
+        _, dual_vals = non_convex_bound.dual(opt_vars, objectives)
+        obj = -jnp.sum(dual_vals)
+      else:
+        obj, _ = non_convex_bound.primal_sumfn(opt_vars, objectives)
+      return obj
+    proj_fun = lambda x: jnp.clip(x, 0., 1.)
+    project_all_params = lambda x: jax.tree_map(proj_fun, x)
 
     # Define the function to optimize a chunk of the nodes of the activation.
     def optimize(objectives: ParamSet, var_set: ParamSet) -> ParamSet:
-
-      # Perform the optimization.
-      if self._num_steps:
-        state = tx.init(var_set)
-
-        def opt_step(_, state_and_var):
-          state, var_set = state_and_var
-          grads = grad_fun(var_set, objectives)
-          updates, new_state = tx.update(grads, state, var_set)
-          unc_var_set = optax.apply_updates(var_set, updates)
-          new_var_set = jax.tree_map(proj_fun, unc_var_set)
-          return new_state, new_var_set
-
-        _, var_set = jax.lax.fori_loop(0, self._num_steps, opt_step,
-                                       (state, var_set))
-
-      return var_set
+      obj_fun = lambda opt_vars: fun_to_opt(opt_vars, objectives)
+      opt_fun = self._optimizer.optimize_fn(obj_fun, project_all_params)
+      return opt_fun(var_set)
 
     return optimize

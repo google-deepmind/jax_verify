@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,8 +74,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
     if use_jit:
       softplus_model = jax.jit(softplus_model)
 
-    jaxpr_maker = jax.make_jaxpr(softplus_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(softplus_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     found_softplus = self._find_eqn_in_simplified_graph(
@@ -100,8 +99,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
 
     inp = jnp.array([[-2., 3.]])
 
-    jaxpr_maker = jax.make_jaxpr(softmax_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(softmax_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     match = self._find_eqn_in_simplified_graph(
@@ -130,8 +128,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
                      [-2., -2.],
                      [3., 3.]])
 
-    jaxpr_maker = jax.make_jaxpr(softmax_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(softmax_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     expand_softmax_simplifier = synthetic_primitives.simplifier_composition(
@@ -168,8 +165,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
       relu_model = jax.jit(relu_model)
 
     inp = jnp.array([[-2., 3.]])
-    jaxpr_maker = jax.make_jaxpr(relu_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(relu_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     match = self._find_eqn_in_simplified_graph(
@@ -194,8 +190,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
       relu_model = jax.jit(relu_model)
 
     inp = jnp.array([[-2., 3.]])
-    jaxpr_maker = jax.make_jaxpr(relu_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(relu_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     match = self._find_eqn_in_simplified_graph(
@@ -220,8 +215,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
       notrelu_model = jax.jit(notrelu_model)
 
     inp = jnp.array([[-2., 3.]])
-    jaxpr_maker = jax.make_jaxpr(notrelu_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(notrelu_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     match = self._find_eqn_in_simplified_graph(
@@ -246,8 +240,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
       leaky_relu_model = jax.jit(leaky_relu_model)
 
     inp = jnp.array([[-2., 3.]])
-    jaxpr_maker = jax.make_jaxpr(leaky_relu_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(leaky_relu_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     match = self._find_eqn_in_simplified_graph(
@@ -272,8 +265,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
       sigmoid_model = jax.jit(sigmoid_model)
 
     inp = jnp.array([[-2., 3.]])
-    jaxpr_maker = jax.make_jaxpr(sigmoid_model)
-    parsed = jaxpr_maker(inp)
+    parsed = synthetic_primitives.make_jaxpr_nojit(sigmoid_model, inp)
     var_is_bound = {parsed.jaxpr.invars[0]: True}
 
     match = self._find_eqn_in_simplified_graph(
@@ -306,8 +298,7 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
     if use_jit:
       linear_model = jax.jit(linear_model)
 
-    jaxpr_maker = jax.make_jaxpr(linear_model)
-    parsed = jaxpr_maker(inp, w1, b1)
+    parsed = synthetic_primitives.make_jaxpr_nojit(linear_model, inp, w1, b1)
     var_is_bound = {invar: is_bound for invar, is_bound
                     in zip(parsed.jaxpr.invars, [True, False, False])}
 
@@ -336,6 +327,40 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
     self._check_correct_impl(
         parsed.jaxpr, synthetic_primitives.group_linear_sequence,
         var_is_bound, inp, w1, b1)
+
+  @parameterized.named_parameters(('jit', True), ('nojit', False))
+  def test_fusedrelu_detected(self, use_jit):
+
+    inp = jnp.array([-1., 1.])
+    key = jax.random.PRNGKey(0)
+
+    key_w, key_b = jax.random.split(key, 2)
+    w = jax.random.uniform(key_w, shape=(2, 5))
+    b = jax.random.uniform(key_b, shape=(5,))
+
+    def net_model(inp, w, b):
+      return jax.nn.relu(inp @ w + b)
+
+    if use_jit:
+      net_model = jax.jit(net_model)
+
+    parsed = synthetic_primitives.make_jaxpr_nojit(net_model, inp, w, b)
+    var_is_bound = {invar: is_bound for invar, is_bound
+                    in zip(parsed.jaxpr.invars, [True] + [False] * 2)}
+
+    match = self._find_eqn_in_simplified_graph(
+        parsed.jaxpr,
+        synthetic_primitives.fused_relu_simplifier,
+        var_is_bound,
+        synthetic_primitives.fused_relu_p)
+
+    self.assertIsNotNone(match)
+
+    # Let's check that the simplification has not modified the behaviour of the
+    # model and can be forwarded through.
+    self._check_correct_impl(
+        parsed.jaxpr, synthetic_primitives.fused_relu_simplifier,
+        var_is_bound, inp, w, b)
 
 if __name__ == '__main__':
   absltest.main()

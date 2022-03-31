@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 DeepMind Technologies Limited.
+# Copyright 2022 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ from jax_verify.src import bound_propagation
 
 Tensor = jnp.ndarray
 TransformContext = bound_propagation.TransformContext
+InputBound = bound_propagation.InputBound
 
 
 class IntersectionBound(bound_propagation.Bound):
@@ -79,20 +80,19 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
     self._base_transforms = base_transforms
 
   def input_transform(
-      self, context: TransformContext, lower_bound: Tensor, upper_bound: Tensor
+      self, context: TransformContext, input_bound: InputBound
   ) -> IntersectionBound:
     """Constructs initial input bounds for each constituent bound type.
 
     Args:
       context: Transform context containing node index.
-      lower_bound: Original concrete lower bound on the input.
-      upper_bound: Original concrete upper bound on the input.
+      input_bound: Original concrete bounds on the input.
 
     Returns:
       Intersection of the constituent input bounds.
     """
     return IntersectionBound(*[
-        transform.input_transform(context, lower_bound, upper_bound)
+        transform.input_transform(context, input_bound)
         for transform in self._base_transforms])
 
   def primitive_transform(

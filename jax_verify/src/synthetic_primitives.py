@@ -308,6 +308,7 @@ def _next_equation(
       return jax.core.new_jaxpr_eqn(
           primitive_invars, primitive_outvars, spec.primitive,
           {'jax_verify_subgraph': sub_jaxpr, **spec_params},
+          jax.core.no_effects,
           graph.eqns[eqn_idx].source_info), eqn_idx + match_len
 
   return graph.eqns[eqn_idx], eqn_idx + 1
@@ -580,7 +581,8 @@ def group_posbilinear(graph: jax.core.Jaxpr,
       new_eqns.append(jax.core.new_jaxpr_eqn(
           posbilinear_jaxpr.invars, posbilinear_jaxpr.outvars, posbilinear_p,
           {'jax_verify_subgraph': posbilinear_jaxpr,
-           'jax_verify_keepjvargs': True}))
+           'jax_verify_keepjvargs': True},
+          jax.core.no_effects))
     else:
       new_eqns.append(eqn)
 
@@ -661,7 +663,8 @@ def group_linear_sequence(graph: jax.core.Jaxpr,
         # now.
         agg_lin_eqn = jax.core.new_jaxpr_eqn(
             sub_jaxpr.invars, sub_jaxpr.outvars, linear_p,
-            {'jax_verify_subgraph': sub_jaxpr, 'jax_verify_keepjvargs': True})
+            {'jax_verify_subgraph': sub_jaxpr, 'jax_verify_keepjvargs': True},
+            jax.core.no_effects)
         new_eqns.append(agg_lin_eqn)
     else:
       # Non linear operation just gets included directly
@@ -776,7 +779,8 @@ def group_fused_relu(graph: jax.core.Jaxpr,
           fused_relu_jaxpr.invars, fused_relu_jaxpr.outvars, fused_relu_p,
           {'jax_verify_subgraph': fused_relu_jaxpr,
            'jax_verify_keepjvargs': True,
-           'jax_verify_fusedlinear': linear_eqn}))
+           'jax_verify_fusedlinear': linear_eqn},
+          jax.core.no_effects))
     elif (eqn.primitive is relu_p and
           eqn.invars[0] in fused_relu_interm_to_output):
       # This is the relu part of the fused relu. We already included it.
@@ -866,7 +870,8 @@ def expand_softmax_simplifier(graph: jax.core.Jaxpr,
       var_is_bound[exp_var] = True
       new_var_idx += 1
       new_eqns.append(jax.core.new_jaxpr_eqn(
-          eqn.invars, [exp_var], lax.exp_p, {}))
+          eqn.invars, [exp_var], lax.exp_p, {},
+          jax.core.no_effects))
 
       # Let's find the parameters of the reduce_sum and of the broadcast
       # operation in the original softmax implementation so that we don't have
@@ -880,7 +885,8 @@ def expand_softmax_simplifier(graph: jax.core.Jaxpr,
       var_is_bound[exp_sum_var] = True
       new_var_idx += 1
       new_eqns.append(jax.core.new_jaxpr_eqn(
-          [exp_var], [exp_sum_var], lax.reduce_sum_p, orig_reduce_sum.params))
+          [exp_var], [exp_sum_var], lax.reduce_sum_p, orig_reduce_sum.params,
+          jax.core.no_effects))
 
       # Add the broadcasting of it.
       broadcast_index = find_prim(softmax_subgraph.eqns, lax.broadcast_in_dim_p)
@@ -891,19 +897,21 @@ def expand_softmax_simplifier(graph: jax.core.Jaxpr,
       new_var_idx += 1
       new_eqns.append(jax.core.new_jaxpr_eqn(
           [exp_sum_var], [broad_expsum_var], lax.broadcast_in_dim_p,
-          orig_broadcast.params))
+          orig_broadcast.params, jax.core.no_effects))
 
       # Take the inverse of the exp sum
       inv_expsum_var = jax.core.Var(new_var_idx, suffix, broad_size_aval)
       var_is_bound[inv_expsum_var] = True
       new_var_idx += 1
       new_eqns.append(jax.core.new_jaxpr_eqn(
-          [broad_expsum_var], [inv_expsum_var], posreciprocal_p, {}))
+          [broad_expsum_var], [inv_expsum_var], posreciprocal_p, {},
+          jax.core.no_effects))
 
       # Multiply the exponential to the (inv exp sum)
       softmax_var = eqn.outvars[0]
       new_eqns.append(jax.core.new_jaxpr_eqn(
-          [exp_var, inv_expsum_var], [softmax_var], jax.lax.mul_p, {}))
+          [exp_var, inv_expsum_var], [softmax_var], jax.lax.mul_p, {},
+          jax.core.no_effects))
     else:
       new_eqns.append(eqn)
 

@@ -163,7 +163,7 @@ def project_duals(dual_vars, dual_types):
   """Projects dual variables to satisfy dual constraints."""
   make_pos = lambda v: None if v is None else jnp.maximum(v, 0)
   _project = lambda v, t: make_pos(v) if t == DualVarTypes.INEQUALITY else v
-  return jax.tree_multimap(_project, dual_vars, dual_types)
+  return jax.tree_map(_project, dual_vars, dual_types)
 
 
 def solve_sdp_dual_simple(verif_instance, key=None, opt=None, num_steps=10000,
@@ -421,7 +421,7 @@ def solve_sdp_dual(verif_instance, key=None, opt=None, num_steps=10000,
     dual_vars = project_duals(dual_vars, verif_instance.dual_types)
 
     if opt_dual_vars:
-      distance_to_opt = jax.tree_multimap(lambda x, y: jnp.linalg.norm(x - y),
+      distance_to_opt = jax.tree_map(lambda x, y: jnp.linalg.norm(x - y),
                                           dual_vars, opt_dual_vars)
       info['distance_to_opt'].append(distance_to_opt)
 

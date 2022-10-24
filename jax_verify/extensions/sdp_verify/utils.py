@@ -596,7 +596,7 @@ def scale_by_variable_opt(multipliers):
 
   def update_fn(updates, _, params=None):
     del params  # Unused.
-    scaled_updates = jax.tree_multimap(lambda a, g: a * g, multipliers, updates)
+    scaled_updates = jax.tree_map(lambda a, g: a * g, multipliers, updates)
     return scaled_updates, None
 
   return optax.GradientTransformation(init_fn, update_fn)

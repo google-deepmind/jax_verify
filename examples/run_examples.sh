@@ -22,9 +22,9 @@ echo "Running run_boundprop.py"
 python3 run_boundprop.py
 python3 run_boundprop.py --model=cnn
 python3 run_boundprop.py --boundprop_method=interval_bound_propagation
-python3 run_boundprop.py --boundprop_method=ibpfastlin_bound_propagation
-python3 run_boundprop.py --boundprop_method=fastlin_bound_propagation
-python3 run_boundprop.py --boundprop_method=crown_bound_propagation
+python3 run_boundprop.py --boundprop_method=ibpforwardfastlin_bound_propagation
+python3 run_boundprop.py --boundprop_method=backward_fastlin_bound_propagation
+python3 run_boundprop.py --boundprop_method=backward_crown_bound_propagation
 python3 run_boundprop.py --boundprop_method=crownibp_bound_propagation
 
 echo "Running run_sdp_verify.py"

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,14 +17,10 @@
 
 from typing import Optional
 
-import jax
 import jax.numpy as jnp
 from jax_verify.src import bound_propagation
-
-
-Tensor = jnp.ndarray
-TransformContext = bound_propagation.TransformContext
-InputBound = bound_propagation.InputBound
+from jax_verify.src import graph_traversal
+from jax_verify.src.types import Primitive, Tensor  # pylint: disable=g-multiple-import
 
 
 class IntersectionBound(bound_propagation.Bound):
@@ -80,7 +76,9 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
     self._base_transforms = base_transforms
 
   def input_transform(
-      self, context: TransformContext, input_bound: InputBound
+      self,
+      context: bound_propagation.TransformContext,
+      input_bound: graph_traversal.InputBound,
   ) -> IntersectionBound:
     """Constructs initial input bounds for each constituent bound type.
 
@@ -96,8 +94,11 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
         for transform in self._base_transforms])
 
   def primitive_transform(
-      self, context: TransformContext,
-      primitive: jax.core.Primitive, *args, **kwargs
+      self,
+      context: bound_propagation.TransformContext,
+      primitive: Primitive,
+      *args: bound_propagation.LayerInput,
+      **kwargs,
   ) -> IntersectionBound:
     """Propagates bounds for each constituent bound type.
 
@@ -120,11 +121,10 @@ class IntersectionBoundTransform(bound_propagation.BoundTransform):
 
     base_args = [base_args_for_arg(arg) for arg in args]
     return IntersectionBound(*[
-        transform.equation_transform(context, primitive, *args, **kwargs)
+        transform.equation_transform(context, primitive, *args, **kwargs)[0]
         for transform, *args in zip(self._base_transforms, *base_args)])
 
-  def should_handle_as_subgraph(
-            self, primitive: jax.core.Primitive) -> bool:
+  def should_handle_as_subgraph(self, primitive: Primitive) -> bool:
     # Handle as a sub-graph only if _all_ intersectands can.
     # Otherwise handle at the higher (synthetic primitive) level.
     return all(base_transform.should_handle_as_subgraph(primitive)

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Bound propagation utilities."""
-from typing import Dict, Generic, Tuple, TypeVar
+from typing import Generic, Mapping, Tuple, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -22,17 +22,9 @@ import jax_verify
 from jax_verify.src import bound_propagation
 from jax_verify.src import graph_traversal
 from jax_verify.src import synthetic_primitives
+from jax_verify.src.types import Index, Nest, Primitive, SpecFn, Tensor  # pylint: disable=g-multiple-import
 
 
-GraphInput = graph_traversal.GraphInput
-InputBound = graph_traversal.InputBound
-Bound = bound_propagation.Bound
-Index = bound_propagation.Index
-TransformContext = bound_propagation.TransformContext
-Nest = bound_propagation.Nest
-Tensor = jnp.ndarray
-LayerInput = bound_propagation.LayerInput
-Primitive = bound_propagation.Primitive
 T = TypeVar('T', bound=graph_traversal.TransformedNode)
 
 
@@ -43,50 +35,61 @@ class FixedBoundApplier(bound_propagation.BoundTransform):
   to existing bounds.
   """
 
-  def __init__(self, fixed_bounds: Dict[Index, Tuple[Tensor, Tensor]]):
+  def __init__(self, fixed_bounds: Mapping[Index, Tuple[Tensor, Tensor]]):
     self._fixed_bounds = fixed_bounds
 
   def input_transform(
-      self, context: TransformContext, input_bound: InputBound
+      self,
+      context: bound_propagation.TransformContext,
+      input_bound: graph_traversal.InputBound,
   ) -> bound_propagation.Bound:
     return jax_verify.IntervalBound(*self._fixed_bounds[context.index])
 
   def primitive_transform(
-      self, context: TransformContext,
-      primitive: jax.core.Primitive, *args, **kwargs
+      self,
+      context: bound_propagation.TransformContext,
+      primitive: Primitive,
+      *args: bound_propagation.LayerInput,
+      **kwargs,
   ) -> bound_propagation.Bound:
     if (context.index not in self._fixed_bounds and
         isinstance(primitive, synthetic_primitives.FakePrimitive)):
       # Bound is missing at the synthetic primitive level.
       # Try and infer the bound from its sub-graph.
       subgraph = kwargs['jax_verify_subgraph']
-      return context.subgraph_handler(self, subgraph, *args)
+      bound, = context.subgraph_handler(self, subgraph, *args)
+      return bound
 
     return jax_verify.IntervalBound(*self._fixed_bounds[context.index])
 
 
-class BoundRetriever(Generic[T], bound_propagation.GraphTransform[T]):
+class BoundRetriever(Generic[T], graph_traversal.GraphTransform[T]):
   """Retrieves bounds' concrete values.
 
   The concrete values of the bound is only obtained when the bounds are queried.
   """
 
-  def __init__(self, base_transform: bound_propagation.GraphTransform[T]):
+  def __init__(self, base_transform: graph_traversal.GraphTransform[T]):
     self._base_transform = base_transform
     self._base_bounds = {}
 
   def input_transform(
-      self, context: TransformContext, input_bound: InputBound
+      self,
+      context: graph_traversal.TransformContext[T],
+      input_bound: graph_traversal.InputBound,
   ) -> T:
     bound = self._base_transform.input_transform(context, input_bound)
     self._base_bounds[context.index] = bound
     return bound
 
   def primitive_transform(
-      self, context: TransformContext,
-      primitive: jax.core.Primitive, *args, **kwargs
+      self,
+      context: graph_traversal.TransformContext[T],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[T],
+      **kwargs,
   ) -> T:
-    bound = self._base_transform.equation_transform(
+    bound, = self._base_transform.equation_transform(
         context, primitive, *args, **kwargs)
     self._base_bounds[context.index] = bound
     return bound
@@ -95,7 +98,7 @@ class BoundRetriever(Generic[T], bound_propagation.GraphTransform[T]):
     return self._base_transform.should_handle_as_subgraph(primitive)
 
   @property
-  def concrete_bounds(self) -> Dict[Index, Tuple[Tensor, Tensor]]:
+  def concrete_bounds(self) -> Mapping[Index, Tuple[Tensor, Tensor]]:
     return {index: (bound.lower, bound.upper)
             for index, bound in self._base_bounds.items()}
 
@@ -104,7 +107,8 @@ class BoundRetriever(Generic[T], bound_propagation.GraphTransform[T]):
     return self._base_transform
 
 
-class BoundRetrieverAlgorithm(bound_propagation.PropagationAlgorithm[Bound]):
+class BoundRetrieverAlgorithm(
+    bound_propagation.PropagationAlgorithm[bound_propagation.Bound]):
   """Algorithm to collect concrete bounds.
 
   Compared to a BoundRetriever Transform, this allows to obtain the final bounds
@@ -112,15 +116,21 @@ class BoundRetrieverAlgorithm(bound_propagation.PropagationAlgorithm[Bound]):
   by different transforms.
   """
 
-  def __init__(self,
-               base_algorithm: bound_propagation.PropagationAlgorithm[Bound]):
+  def __init__(
+      self,
+      base_algorithm: bound_propagation.PropagationAlgorithm[
+          bound_propagation.Bound]):
     self._base_algorithm = base_algorithm
     self._base_bounds = {}
 
   def propagate(
-      self, graph: bound_propagation.PropagationGraph,
-      inputs: Nest[GraphInput],
-  ) -> Tuple[Nest[Bound], Dict[jax.core.Var, LayerInput]]:
+      self,
+      graph: graph_traversal.PropagationGraph,
+      inputs: Nest[graph_traversal.GraphInput],
+  ) -> Tuple[
+      Nest[bound_propagation.Bound],
+      Mapping[jax.core.Var, bound_propagation.LayerInput],
+  ]:
     outvals, env = self._base_algorithm.propagate(graph, inputs)
     self._base_bounds = {
         index: graph_traversal.read_env(env, graph.jaxpr_node(index))
@@ -128,7 +138,7 @@ class BoundRetrieverAlgorithm(bound_propagation.PropagationAlgorithm[Bound]):
     return outvals, env
 
   @property
-  def concrete_bounds(self) -> Dict[Index, Tuple[Tensor, Tensor]]:
+  def concrete_bounds(self) -> Mapping[Index, Tuple[Tensor, Tensor]]:
     return {index: (bound.lower, bound.upper)
             for index, bound in self._base_bounds.items()}
 
@@ -137,13 +147,18 @@ class VacuousBoundTransform(bound_propagation.BoundTransform):
   """Generates vacuously loose bounds."""
 
   def input_transform(
-      self, context: TransformContext, input_bound: InputBound
+      self,
+      context: bound_propagation.TransformContext,
+      input_bound: graph_traversal.InputBound
   ) -> bound_propagation.Bound:
     return _vacuous_bounds(input_bound.lower)
 
   def primitive_transform(
-      self, context: TransformContext,
-      primitive: jax.core.Primitive, *args, **kwargs
+      self,
+      context: bound_propagation.TransformContext,
+      primitive: Primitive,
+      *args: bound_propagation.LayerInput,
+      **kwargs,
   ) -> bound_propagation.Bound:
     template_args = [
         jnp.zeros_like(arg.lower)
@@ -167,14 +182,14 @@ class GraphNode(bound_propagation.Bound):
     self.kwargs = kwargs
 
     if self.is_input():
-      input_bound: InputBound = args[0]
+      input_bound: graph_traversal.InputBound = args[0]
       self._shape = input_bound.lower.shape
+      self._dtype = input_bound.lower.dtype
     else:
-      template_args = [
-          jnp.zeros(arg.shape) if isinstance(arg, GraphNode) else arg
-          for arg in args]
       kwarged_fun = lambda x: primitive.bind(*x, **kwargs)
-      self._shape = jax.eval_shape(kwarged_fun, template_args).shape
+      shape_and_type = jax.eval_shape(kwarged_fun, args)
+      self._shape = shape_and_type.shape
+      self._dtype = shape_and_type.dtype
 
   def is_input(self):
     return self.primitive is None
@@ -184,19 +199,23 @@ class GraphNode(bound_propagation.Bound):
     return self._shape
 
   @property
+  def dtype(self):
+    return self._dtype
+
+  @property
   def lower(self):
-    return -float('inf') * jnp.ones(self._shape)
+    return -float('inf') * jnp.ones(self._shape, self._dtype)
 
   @property
   def upper(self):
-    return float('inf') * jnp.ones(self._shape)
+    return float('inf') * jnp.ones(self._shape, self._dtype)
 
 
-class GraphInspector(bound_propagation.GraphTransform[GraphNode]):
+class GraphInspector(graph_traversal.GraphTransform[GraphNode]):
   """Graph traverser that exposes the nodes."""
 
   def __init__(self, subgraph_decider=None):
-    self.nodes = {}
+    self._nodes = {}
     self._subgraph_decider = subgraph_decider
 
   def should_handle_as_subgraph(self, primitive: Primitive) -> bool:
@@ -206,15 +225,36 @@ class GraphInspector(bound_propagation.GraphTransform[GraphNode]):
       return super().should_handle_as_subgraph(primitive)
 
   def input_transform(
-      self, context: TransformContext, input_bound: InputBound
+      self,
+      context: graph_traversal.TransformContext[GraphNode],
+      input_bound: graph_traversal.InputBound,
   ) -> GraphNode:
-    self.nodes[context.index] = GraphNode(context.index, None, input_bound)
-    return self.nodes[context.index]
+    self._nodes[context.index] = GraphNode(context.index, None, input_bound)
+    return self._nodes[context.index]
 
   def primitive_transform(
-      self, context: TransformContext,
-      primitive: jax.core.Primitive, *args, **kwargs
+      self,
+      context: graph_traversal.TransformContext[GraphNode],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[GraphNode],
+      **kwargs,
   ) -> GraphNode:
-    self.nodes[context.index] = GraphNode(context.index,
-                                          primitive, *args, **kwargs)
-    return self.nodes[context.index]
+    self._nodes[context.index] = GraphNode(
+        context.index, primitive, *args, **kwargs)
+    return self._nodes[context.index]
+
+  @property
+  def nodes(self) -> Mapping[Index, GraphNode]:
+    return self._nodes
+
+
+def computation_graph_nodes(
+    spec_fn: SpecFn,
+    *init_bound: Nest[graph_traversal.GraphInput],
+) -> Mapping[Index, GraphNode]:
+  """Extract a mapping from index to primitives."""
+  inspector = GraphInspector()
+  bound_propagation.bound_propagation(
+      bound_propagation.ForwardPropagationAlgorithm(inspector),
+      spec_fn, *init_bound)
+  return inspector.nodes

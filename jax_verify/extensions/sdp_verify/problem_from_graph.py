@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Facilities to construct SDP Verification problem instances."""
 
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
@@ -21,16 +20,15 @@ from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 import jax.numpy as jnp
 from jax_verify.extensions.sdp_verify import utils
 from jax_verify.src import bound_propagation
+from jax_verify.src import graph_traversal
 from jax_verify.src import synthetic_primitives
+from jax_verify.src.types import Index, Primitive, Tensor  # pylint: disable=g-multiple-import
 import numpy as np
 
 
 Bound = bound_propagation.Bound
-Tensor = bound_propagation.Tensor
-Index = bound_propagation.Index
-Primitive = bound_propagation.Primitive
-InputBound = bound_propagation.InputBound
-TransformContext = bound_propagation.TransformContext
+InputBound = graph_traversal.InputBound
+TransformContext = graph_traversal.TransformContext
 SdpDualVerifInstance = utils.SdpDualVerifInstance
 
 
@@ -69,8 +67,8 @@ class SdpReluProblem:
     dual_types = []
     num_kappa = 1
     for node in self._env.values():
-      if isinstance(node, Bound) and not node.is_affine:
-        node_dual_shapes, node_dual_types = node.dual_shapes_and_types()
+      if isinstance(node, Bound) and not node.is_affine:  # pytype: disable=attribute-error  # jax-ndarray
+        node_dual_shapes, node_dual_types = node.dual_shapes_and_types()  # pytype: disable=attribute-error  # jax-ndarray
         dual_shapes.append(node_dual_shapes)
         dual_types.append(node_dual_types)
         num_kappa += np.prod(node.shape[1:], dtype=np.int32)
@@ -82,7 +80,7 @@ class SdpReluProblem:
     return [
         utils.IntBound(lb=node.lower, ub=node.upper, lb_pre=None, ub_pre=None)
         for node in self._env.values()
-        if isinstance(node, Bound) and not node.is_affine]
+        if isinstance(node, Bound) and not node.is_affine]  # pytype: disable=attribute-error  # jax-ndarray
 
   def _build_lagrangian_fn(
       self,
@@ -108,7 +106,7 @@ class SdpReluProblem:
       Function that computes Lagrangian L(x) with fixed `dual_vars`.
     """
     nodes = [node for node in self._env.values()
-             if isinstance(node, Bound) and not node.is_affine]
+             if isinstance(node, Bound) and not node.is_affine]  # pytype: disable=attribute-error  # jax-ndarray
     assert len(dual_vars) == len(nodes) + 1
 
     def lagrangian(xs):
@@ -121,7 +119,7 @@ class SdpReluProblem:
         if isinstance(node, SdpNode):
           node.forward_propagate(ys)
 
-      lag = jnp.reshape(ys[self._output_node.index], ())
+      lag = jnp.reshape(ys[self._output_node.index], ())  # pytype: disable=attribute-error  # jax-ndarray
       for node, node_dual_vars, x in zip(nodes, dual_vars[:-1], xs):
         lag += node.lagrangian_contrib(node_dual_vars, x, ys)
       return lag
@@ -222,13 +220,13 @@ class SdpNode(Bound):
     if 'nu' in dual_vars:
       lag += -jnp.sum(dual_vars['nu'] *
                       (x - self.lower) * (x - self.upper))
-    return lag
+    return lag  # pytype: disable=bad-return-type  # jax-ndarray
 
   def forward_propagate(self, xs: Dict[Index, Tensor]):
     self._forward_propagate_fn(xs)
 
 
-class _SdpTransform(bound_propagation.GraphTransform[SdpNode]):
+class _SdpTransform(graph_traversal.GraphTransform[SdpNode]):
   """Converts a specification function into an SDP problem."""
 
   def __init__(self, boundprop_transform: bound_propagation.BoundTransform):
@@ -252,7 +250,7 @@ class _SdpTransform(bound_propagation.GraphTransform[SdpNode]):
   ) -> SdpNode:
     arg_bounds = [arg.base_bound if isinstance(arg, SdpNode) else arg
                   for arg in args]
-    bound = self._boundprop_transform.equation_transform(
+    bound, = self._boundprop_transform.equation_transform(
         context, primitive, *arg_bounds, **params)
     if primitive == synthetic_primitives.relu_p:
       preact, = args

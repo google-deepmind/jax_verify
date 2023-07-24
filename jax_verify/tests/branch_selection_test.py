@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,6 +59,19 @@ class BranchSelectionTest(chex.TestCase):
     chex.assert_trees_all_close((free_bounds.lower, free_bounds.upper),
                                 (other_lay_bound.lower, other_lay_bound.upper))
 
+  def test_infeasible_bounds_detection(self):
+
+    non_crossing_bounds = ibp.IntervalBound(jnp.zeros(3,), jnp.ones(3,))
+    crossing_bounds = ibp.IntervalBound(jnp.array([0., 0., 1.]),
+                                        jnp.array([1., 1., 0.5]))
+
+    non_crossing_infeasible = branch_selection.infeasible_bounds(
+        non_crossing_bounds.to_jittable())
+    self.assertFalse(non_crossing_infeasible)
+
+    crossing_infeasible = branch_selection.infeasible_bounds(
+        crossing_bounds.to_jittable())
+    self.assertTrue(crossing_infeasible)
 
 if __name__ == '__main__':
   absltest.main()

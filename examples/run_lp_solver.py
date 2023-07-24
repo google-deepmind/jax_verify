@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import jax_verify
 from jax_verify.extensions.sdp_verify import utils
 from jax_verify.src.linear import forward_linear_bounds
+from jax_verify.src.mip_solver.solve_relaxation import solve_planet_relaxation
 import numpy as np
 
 MLP_PATH = 'models/raghunathan18_pgdnn.pkl'
@@ -103,11 +104,11 @@ def main(unused_args):
                         jnp.ones_like(dummy_output[0, ...]),
                         jnp.zeros_like(dummy_output[0, ...]))
   objective_bias = 0.
-  value, _, status = jax_verify.solve_planet_relaxation(
+  value, _, status = solve_planet_relaxation(
       logits_fn, init_bound, boundprop_transform, objective,
       objective_bias, index=0)
   logging.info('Relaxation LB is : %f, Status is %s', value, status)
-  value, _, status = jax_verify.solve_planet_relaxation(
+  value, _, status = solve_planet_relaxation(
       logits_fn, init_bound, boundprop_transform, -objective,
       objective_bias, index=0)
   logging.info('Relaxation UB is : %f, Status is %s', -value, status)

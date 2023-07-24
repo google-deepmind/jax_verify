@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Tests for sdp_verify.py."""
 
 import os
@@ -176,7 +175,7 @@ class SdpVerifyTest(parameterized.TestCase):
       assert len(dual_vars) == 3, 'Input, one hidden layer, kappa'
       assert isinstance(dual_vars[0], problem.DualVar)
       assert isinstance(dual_vars[1], problem.DualVarFin)
-      assert isinstance(dual_vars[2], jax.interpreters.xla.DeviceArray)
+      assert isinstance(dual_vars[2], jax.Array)
 
   def test_ibp_init_matches_ibp_bound(self):
     for nn in ['cnn', 'mlp']:

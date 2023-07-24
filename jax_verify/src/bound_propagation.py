@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ and translating the computational graph.
 """
 import abc
 import collections
-from typing import Callable, Dict, Generic, List, Tuple, TypeVar, Union
+from typing import Generic, Mapping, Sequence, Tuple, TypeVar, Union
 
 import jax
 from jax import lax
@@ -28,21 +28,9 @@ import jax.numpy as jnp
 
 from jax_verify.src import graph_traversal
 from jax_verify.src import synthetic_primitives
+from jax_verify.src.types import Nest, Primitive, SpecFn, Tensor  # pylint: disable=g-multiple-import
 
 
-Tensor = jnp.ndarray
-Nest = graph_traversal.Nest
-Primitive = graph_traversal.Primitive
-Index = graph_traversal.Index
-GraphInput = graph_traversal.GraphInput
-InputBound = graph_traversal.InputBound
-TransformContext = graph_traversal.TransformContext
-PropagationGraph = graph_traversal.PropagationGraph
-GraphTransform = graph_traversal.GraphTransform
-OpwiseGraphTransform = graph_traversal.OpwiseGraphTransform
-UpdatedGraphTransform = graph_traversal.UpdatedGraphTransform
-BackwardGraphTransform = graph_traversal.BackwardGraphTransform
-BackwardOpwiseTransform = graph_traversal.BackwardOpwiseTransform
 Repr = TypeVar('Repr', bound=graph_traversal.TransformedNode)
 
 
@@ -60,21 +48,28 @@ JittableInputBound = collections.namedtuple(
 JittableGraphInput = Union[JittableInputBound, Tensor]
 
 
-class Bound(graph_traversal.TransformedNode):
+class Bound(graph_traversal.TransformedNode, metaclass=abc.ABCMeta):
   """Abstract propagated bound."""
 
-  @abc.abstractproperty
+  @property
+  @abc.abstractmethod
   def lower(self) -> Tensor:
     """Concrete lower bound."""
 
-  @abc.abstractproperty
+  @property
+  @abc.abstractmethod
   def upper(self) -> Tensor:
     """Concrete upper bound."""
 
   @property
-  def shape(self) -> Tuple[int]:
-    """Shape of the bound."""
+  def shape(self) -> Tuple[int, ...]:
+    """Shape of the node."""
     return self.lower.shape
+
+  @property
+  def dtype(self) -> jnp.dtype:
+    """Data type of the node."""
+    return self.lower.dtype
 
   def unwrap(self) -> 'Bound':
     """Underlying bound of method-specific type, without extra constraints.
@@ -89,10 +84,11 @@ class Bound(graph_traversal.TransformedNode):
     return self
 
 
-LayerInput = Union[Bound, Tensor]
+LayerInput = graph_traversal.LayerInput[Bound]
+TransformContext = graph_traversal.TransformContext[Bound]
 
 
-class IntervalBound(Bound, InputBound):
+class IntervalBound(Bound, graph_traversal.InputBound):
   """Represent an interval where some activations might be valid."""
 
   def __init__(self, lower_bound: Tensor, upper_bound: Tensor):  # pylint: disable=super-init-not-called
@@ -120,6 +116,9 @@ class IntervalBound(Bound, InputBound):
   def to_jittable(self) -> JittableInputBound:
     return JittableInputBound(self.lower, self.upper, {IntervalBound: None}, {})
 
+  def project_onto_bound(self, tensor: Tensor) -> Tensor:
+    return jnp.clip(tensor, a_min=self._lower_bound, a_max=self._upper_bound)
+
 
 def unwrapping(fn):
   """Create a wrapper function to unwrap the bound arguments.
@@ -142,7 +141,7 @@ def unwrapping(fn):
   return fn_unwrapped
 
 
-BoundTransform = GraphTransform[Bound]
+BoundTransform = graph_traversal.GraphTransform[Bound]
 
 
 class PropagationAlgorithm(Generic[Repr], metaclass=abc.ABCMeta):
@@ -150,28 +149,30 @@ class PropagationAlgorithm(Generic[Repr], metaclass=abc.ABCMeta):
   @abc.abstractmethod
   def propagate(
       self,
-      graph: PropagationGraph,
-      bounds: Nest[GraphInput],
-  ) -> Tuple[Nest[Repr], Dict[jax.core.Var, Union[Repr, Tensor]]]:
+      graph: graph_traversal.PropagationGraph,
+      bounds: Nest[graph_traversal.GraphInput],
+  ) -> Tuple[Nest[Repr], Mapping[jax.core.Var, Union[Repr, Tensor]]]:
     """Propagate the given input bounds on the given graph."""
 
 
 class ForwardPropagationAlgorithm(PropagationAlgorithm[Repr]):
   """Forward graph propagation method."""
 
-  def __init__(self, graph_transform: GraphTransform[Repr]):
+  def __init__(self, graph_transform: graph_traversal.GraphTransform[Repr]):
     self._graph_transform = graph_transform
 
   def propagate(
       self,
-      graph: PropagationGraph,
-      bounds: Nest[GraphInput],
-  ) -> Tuple[Nest[Repr], Dict[jax.core.Var, Union[Repr, Tensor]]]:
+      graph: graph_traversal.PropagationGraph,
+      bounds: Nest[graph_traversal.GraphInput],
+  ) -> Tuple[Nest[Repr], Mapping[jax.core.Var, Union[Repr, Tensor]]]:
     """Propagate forward the given input bounds on the given graph."""
     return graph.forward_propagation(self._graph_transform, bounds)
 
 
-def jit_inputs(*inputs: Nest[GraphInput]) -> List[Nest[JittableGraphInput]]:
+def jit_inputs(
+    *inputs: Nest[graph_traversal.GraphInput],
+) -> Sequence[Nest[JittableGraphInput]]:
   """Replace all the bound objects by jittable bounds."""
   is_bound = lambda b: isinstance(b, Bound)
   jit_bound = lambda b: b.to_jittable()
@@ -180,7 +181,9 @@ def jit_inputs(*inputs: Nest[GraphInput]) -> List[Nest[JittableGraphInput]]:
       inputs, is_leaf=is_bound)
 
 
-def unjit_inputs(*inputs: Nest[JittableGraphInput]) -> List[Nest[GraphInput]]:
+def unjit_inputs(
+    *inputs: Nest[JittableGraphInput],
+) -> Sequence[Nest[graph_traversal.GraphInput]]:
   """Replace all the jittable bounds by standard bound objects."""
   is_jittable_bound = lambda b: isinstance(b, JittableInputBound)
   unjit_bound = lambda b: next(iter(b.bound_type)).from_jittable(b)
@@ -191,12 +194,12 @@ def unjit_inputs(*inputs: Nest[JittableGraphInput]) -> List[Nest[GraphInput]]:
 
 def bound_propagation(
     prop_alg: PropagationAlgorithm[Repr],
-    function: Callable[..., Nest[Tensor]],
-    *bounds: Nest[GraphInput],
+    function: SpecFn,
+    *bounds: Nest[graph_traversal.GraphInput],
     graph_simplifier=synthetic_primitives.default_simplifier,
 ) -> Tuple[
     Nest[Union[Repr, Tensor]],
-    Dict[jax.core.Var, Union[Repr, Tensor, Bound]]]:
+    Mapping[jax.core.Var, Union[Repr, Tensor, Bound]]]:
   """Performs Bound Propagation on the model implemented by `function`.
 
   Args:
@@ -217,18 +220,19 @@ def bound_propagation(
   """
   # Parse the computation graph.
   placeholder_inputs = jax.tree_util.tree_map(
-      lambda b: b.lower if isinstance(b, Bound) else b,
+      lambda b: b.lower if isinstance(b, graph_traversal.InputBound) else b,
       bounds)
   parsed = synthetic_primitives.make_jaxpr_nojit(function, *placeholder_inputs)
   output_shapes = jax.eval_shape(function, *placeholder_inputs)
 
   flat_is_bound, _ = jax.tree_util.tree_flatten(
-      jax.tree_util.tree_map(lambda b: isinstance(b, Bound), bounds))
+      jax.tree_util.tree_map(
+          lambda b: isinstance(b, graph_traversal.InputBound), bounds))
   inp_is_bound = {var: is_bound
                   for var, is_bound in zip(parsed.jaxpr.invars, flat_is_bound)}
   simplified_graph = synthetic_primitives.simplify_graph(
       graph_simplifier, parsed.jaxpr, inp_is_bound)
-  graph = PropagationGraph(simplified_graph, parsed.literals)
+  graph = graph_traversal.PropagationGraph(simplified_graph, parsed.literals)
 
   outvals, env = prop_alg.propagate(graph, bounds)
 
@@ -239,21 +243,24 @@ def bound_propagation(
   return outvals, env
 
 
-RESHAPE_PRIMITIVES = [
+RESHAPE_PRIMITIVES: Sequence[Primitive] = [
+    lax.copy_p,
     lax.reshape_p,
+    lax.slice_p,
+    lax.dynamic_slice_p,
     lax.squeeze_p,
     lax.transpose_p,
     lax.broadcast_in_dim_p,
     lax.concatenate_p,
     lax.gather_p,
     lax.scatter_p,
+    *([lax.select_p] if hasattr(lax, 'select_p') else []),
+    *([lax.select_n_p] if hasattr(lax, 'select_n_p') else []),
+    synthetic_primitives.convert_float32_p,
 ]
-if hasattr(lax, 'select_p'):
-  RESHAPE_PRIMITIVES.append(lax.select_p)
-if hasattr(lax, 'select_n_p'):
-  RESHAPE_PRIMITIVES.append(lax.select_n_p)
 
-BILINEAR_PRIMITIVES = [
+
+BILINEAR_PRIMITIVES: Sequence[Primitive] = [
     lax.mul_p,
     lax.dot_general_p,
     lax.conv_general_dilated_p,
@@ -266,13 +273,14 @@ BILINEAR_PRIMITIVES = [
 # into AFFINE_PRIMITIVES.
 
 
-AFFINE_PRIMITIVES = [
+AFFINE_PRIMITIVES: Sequence[Primitive] = [
     lax.scatter_add_p,
     lax.add_p,
     lax.sub_p,
     lax.reduce_sum_p,
     lax.neg_p,
     synthetic_primitives.linear_p,
-] + BILINEAR_PRIMITIVES
+    *BILINEAR_PRIMITIVES,
+]
 # lax.div_p can also be treated as an affine primitive, subject to checking
 # that its second arg (the divisor) is a constant.

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ Create mc-cormick relaxations of bilinear terms for boundprop and verification.
 from typing import Callable, Tuple
 
 import jax.numpy as jnp
+from jax_verify.src.types import Tensor
 
-Tensor = jnp.ndarray
 BilinearFun = Callable[[Tensor, Tensor], Tensor]
 
 
@@ -118,5 +118,5 @@ def mccormick_outer_product(x: Tensor,
   output_lb_a, output_lb_b, output_ub_a, output_ub_b = [
       relax_fn(x, y) for relax_fn in posbilinear_mccormick_relaxations(
           outer, x_lb, x_ub, y_lb, y_ub)]
-  return (jnp.maximum(output_lb_a, output_lb_b),
+  return (jnp.maximum(output_lb_a, output_lb_b),  # pytype: disable=bad-return-type  # jax-ndarray
           jnp.minimum(output_ub_a, output_ub_b))

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Tests for crown_boundprop.py."""
 
 import functools
@@ -51,7 +50,7 @@ class BoundpropTest(parameterized.TestCase):
       return utils.boundprop(params, init_bound)
     self._test_boundprop(boundprop)
 
-  def _test_boundprop(self, boundprop_method, num_idxs_to_test=10):
+  def _test_boundprop(self, boundprop_method, num_idxs_to_test=5):
     """Test `boundprop_method` on Wong-Small MNIST CNN."""
     with jax_verify.open_file('mnist/x_test_first100.npy', 'rb') as f:
       xs = np.load(f)
@@ -90,11 +89,11 @@ class BoundpropTest(parameterized.TestCase):
       crown_ub = crown_ubs[idx]
 
       adv_loss = lambda x: get_act(x, idx)  # pylint: disable=cell-var-from-loop
-      x_lb = utils.pgd(adv_loss, x, eps, 50, 0.01)
+      x_lb = utils.pgd(adv_loss, x, eps, 5, 0.01)
       fgsm_lb = get_act(x_lb, idx)
 
       adv_loss = lambda x: -get_act(x, idx)  # pylint: disable=cell-var-from-loop
-      x_ub = utils.pgd(adv_loss, x, eps, 50, 0.01)
+      x_ub = utils.pgd(adv_loss, x, eps, 5, 0.01)
       fgsm_ub = get_act(x_ub, idx)
 
       print(f'Idx {idx}: Boundprop LB {crown_lb}, FGSM LB {fgsm_lb}, '

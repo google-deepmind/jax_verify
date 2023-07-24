@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,9 +35,9 @@ class MixedStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     """Solve maximization problem of opt_instance with a combination of solvers.
 
     Args:
@@ -60,7 +60,7 @@ class MixedStrategy(dual_build.InnerMaxStrategy):
                                                 inner_dual_vars):
       final_value += solver_weight * solver.solve_max(inner_var, opt_instance,
                                                       key, step)
-    return final_value
+    return final_value  # pytype: disable=bad-return-type  # jnp-array
 
   def init_layer_inner_params(self, opt_instance):
     """Returns initial inner maximisation duals and their types."""

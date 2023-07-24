@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 """Strategies for selecting the neuron on which to branch."""
 
 import abc
+import collections
 import enum
 import functools
 import math
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -29,15 +30,9 @@ from jax_verify.src import graph_traversal
 from jax_verify.src import synthetic_primitives
 from jax_verify.src.branching import backpropagation
 from jax_verify.src.linear import linear_relaxations
+from jax_verify.src.types import Index, Nest, Primitive, SpecFn, Tensor  # pylint: disable=g-multiple-import
 
 
-Tensor = jnp.ndarray
-Nest = bound_propagation.Nest
-TensorFun = Callable[..., Tensor]
-Index = bound_propagation.Index
-Bound = bound_propagation.Bound
-GraphInput = bound_propagation.GraphInput
-InputBound = bound_propagation.InputBound
 BranchDecision = NamedTuple('BranchDecision', [
     ('node_index', Index),
     ('neuron_index', int),
@@ -48,7 +43,7 @@ BranchPlane = NamedTuple('BranchPlane', [
     ('lower_branch', BranchDecision),
     ('upper_branch', BranchDecision)
 ])
-BranchingDecisionList = List[BranchDecision]
+BranchingDecisionList = Sequence[BranchDecision]
 JittableBranchingDecisions = NamedTuple('JittableBranchingDecisions', [
     ('node_indices', Tensor),
     ('neuron_indices', Tensor),
@@ -56,9 +51,8 @@ JittableBranchingDecisions = NamedTuple('JittableBranchingDecisions', [
     ('is_upper_branch', Tensor)])
 InputAnalysis = Any
 ScoringInputs = Any
-BranchHeuristicInputs = Dict[str, Any]
+BranchHeuristicInputs = Mapping[str, Any]
 BranchVal = Union[Tensor, Tuple[Tensor, Tensor]]
-JittableInputBound = bound_propagation.JittableInputBound
 
 relaxation_area = lambda lb, ub: -ub * lb
 mid_point = lambda lb, ub: (lb + ub) / 2.0
@@ -77,8 +71,8 @@ class BranchNeuronSelector(metaclass=abc.ABCMeta):
   @abc.abstractmethod
   def analyse_inputs(
       self,
-      spec_fn: TensorFun,
-      *init_bound: Nest[GraphInput],
+      spec_fn: SpecFn,
+      *init_bound: Nest[graph_traversal.GraphInput],
   ) -> InputAnalysis:
     """Performs pre-computation for an input.
 
@@ -99,7 +93,7 @@ class BranchNeuronSelector(metaclass=abc.ABCMeta):
       self,
       input_analysis: InputAnalysis,
       heuristic_inputs: BranchHeuristicInputs,
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     """Compute branching scores for all neurons.
 
     Args:
@@ -116,11 +110,11 @@ class BranchNeuronSelector(metaclass=abc.ABCMeta):
 
 
 def selector_scoring_fn(
-    spec_fn: TensorFun,
+    spec_fn: SpecFn,
     branch_neuron_selector: BranchNeuronSelector,
     heuristic_inputs: BranchHeuristicInputs,
-    *jit_input_bounds: Nest[JittableInputBound]
-) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+    *jit_input_bounds: Nest[bound_propagation.JittableInputBound]
+) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
   """Score the neurons in a jittable fashion for a BranchNeuronSelector.
 
   The best way to use this function is to bind the first two arguments at the
@@ -161,7 +155,7 @@ class NodeSelector(BranchNeuronSelector, metaclass=abc.ABCMeta):
       self,
       input_analysis: InputAnalysis,
       heuristic_inputs: BranchHeuristicInputs,
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     score_inps = self.preprocess_heuristics(input_analysis, heuristic_inputs)
     return self.score_handled_nodes(score_inps)
 
@@ -193,8 +187,8 @@ class NodeSelector(BranchNeuronSelector, metaclass=abc.ABCMeta):
   @abc.abstractmethod
   def score_handled_nodes(
       self,
-      score_inputs: ScoringInputs,
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+      scoring_inputs: ScoringInputs,
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     """Returns the branching decisions as well as a score for each of them."""
 
 
@@ -208,8 +202,7 @@ class CompositeNodeSelector(BranchNeuronSelector):
     self._selectors = selectors
     self._coefficients = coefficients
 
-  def analyse_inputs(self, spec_fn: Callable[..., Tensor],
-                     *init_bounds) -> InputAnalysis:
+  def analyse_inputs(self, spec_fn: SpecFn, *init_bounds) -> InputAnalysis:
     input_analyses = {}
     for selector in self._selectors:
       if selector.analysis_type() not in input_analyses:
@@ -221,7 +214,7 @@ class CompositeNodeSelector(BranchNeuronSelector):
       self,
       input_analysis: InputAnalysis,
       heuristic_inputs: BranchHeuristicInputs,
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     weigh_scores = lambda weight, x: weight * x
 
     scoring_inputs = {}
@@ -257,8 +250,8 @@ class ReluSelector(NodeSelector):
 
   def analyse_inputs(
       self,
-      spec_fn: Callable[..., Tensor],
-      *init_bound: Nest[GraphInput],
+      spec_fn: SpecFn,
+      *init_bound: Nest[graph_traversal.GraphInput],
   ) -> InputAnalysis:
     """Performs pre-computation for an input."""
     graph_nodes = computation_graph_nodes(spec_fn, *init_bound)
@@ -271,7 +264,7 @@ class ReluSelector(NodeSelector):
   def score_handled_nodes(
       self,
       scoring_inputs: ScoringInputs
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     """Compute ambiguity scores for ReLU pre-activation."""
     preact_indices, heuristic_inputs = scoring_inputs
     bounds = heuristic_inputs['intermediate_bounds']
@@ -282,7 +275,7 @@ class ReluSelector(NodeSelector):
 
     return (
         {index: masked_ambiguity(*bounds[index]) for index in preact_indices},
-        None,
+        {index: jnp.zeros_like(bounds[index][0]) for index in preact_indices},
     )
 
 
@@ -294,11 +287,20 @@ class BoundInfoSelector(NodeSelector):
 
   def analyse_inputs(
       self,
-      spec_fn: Callable[..., Tensor],
-      *init_bound: Nest[GraphInput],
+      spec_fn: SpecFn,
+      *init_bound: Nest[graph_traversal.GraphInput],
   ) -> InputAnalysis:
     """Performs pre-computation for an input."""
-    return bound_input_info(*init_bound)
+    bound_info = {}
+    input_info = bound_input_info(*init_bound)
+    bound_info.update(input_info)
+
+    graph_nodes = computation_graph_nodes(spec_fn, *init_bound)
+    bound_info['relu_preact_indices'] = primitive_preact_indices(
+        graph_nodes, [synthetic_primitives.relu_p])
+    bound_info['sign_preact_indices'] = primitive_preact_indices(
+        graph_nodes, [jax.lax.sign_p])
+    return bound_info
 
 
 class InputSelector(BoundInfoSelector):
@@ -318,7 +320,7 @@ class InputSelector(BoundInfoSelector):
   def score_handled_nodes(
       self,
       scoring_inputs: ScoringInputs,
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, Tensor]]]:
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, Tensor]]:
     """Compute ambiguity scores for inputs."""
     input_analysis, heuristic_inputs = scoring_inputs
     input_indices = input_analysis['input_indices']
@@ -358,8 +360,8 @@ class SensitivitySelector(NodeSelector, metaclass=abc.ABCMeta):
 
   def analyse_inputs(
       self,
-      spec_fn: Callable[..., Tensor],
-      *init_bounds: Nest[GraphInput],
+      spec_fn: SpecFn,
+      *init_bounds: Nest[graph_traversal.GraphInput],
   ) -> InputAnalysis:
     """Performs pre-computation for an input."""
     graph_nodes = computation_graph_nodes(spec_fn, *init_bounds)
@@ -380,7 +382,7 @@ class SensitivitySelector(NodeSelector, metaclass=abc.ABCMeta):
     for node in inspector.nodes.values():
       # Forward-propagate the bias.
       if node.is_input():
-        input_bound: InputBound = node.args[0]
+        input_bound: graph_traversal.InputBound = node.args[0]
         bias = jnp.zeros_like(input_bound.lower)
       else:
         is_bound = lambda b: isinstance(b, bound_propagation.Bound)
@@ -400,7 +402,7 @@ class SensitivitySelector(NodeSelector, metaclass=abc.ABCMeta):
       self,
       input_analysis: InputAnalysis,
       heuristic_inputs: BranchHeuristicInputs,
-  ) -> Tuple[InputAnalysis, BranchHeuristicInputs, Dict[Index, Tensor]]:
+  ) -> Tuple[InputAnalysis, BranchHeuristicInputs, Mapping[Index, Tensor]]:
     """Compute scores to determine the influential ReLUs on which to branch."""
     (spec_fn, init_bounds, graph_nodes, bound_info,
      output_node_index, _) = input_analysis
@@ -408,7 +410,8 @@ class SensitivitySelector(NodeSelector, metaclass=abc.ABCMeta):
     bounds = heuristic_inputs['intermediate_bounds']
 
     preact_indices = primitive_preact_indices(graph_nodes,
-                                              [synthetic_primitives.relu_p])
+                                              [synthetic_primitives.relu_p,
+                                               jax.lax.sign_p])
     input_indices = bound_info['input_indices']
 
     output_sensitivity = None
@@ -437,8 +440,8 @@ class SmartReluSelector(SensitivitySelector):
       self,
       scoring_inputs: Tuple[InputAnalysis,
                             BranchHeuristicInputs,
-                            Dict[Index, Tensor]],
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+                            Mapping[Index, Tensor]],
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     """Compute neuron scores for a given node, given sensitivity and bounds.
 
     This implements Equation (9) in "Branch and Bound for Piecewise Linear
@@ -450,8 +453,7 @@ class SmartReluSelector(SensitivitySelector):
         computed sensitivities
     Returns:
       scores: Scores for branching on each ReLU of the network.
-      branch_vals: None, which by default corresponds to branching over the zero
-        values.
+      branch_vals: Branching values for the ReLUs (always 0).
     """
     input_analysis, heuristic_inputs, sensitivities = scoring_inputs
     _, _, graph_nodes, _, _, biases = input_analysis
@@ -484,6 +486,49 @@ class SmartReluSelector(SensitivitySelector):
     return scores, branch_vals
 
 
+class SmartSignSelector(SensitivitySelector):
+  """Neuron selection strategy based on estimated influence on output objective.
+  """
+
+  def score_handled_nodes(
+      self,
+      scoring_inputs: Tuple[InputAnalysis,
+                            BranchHeuristicInputs,
+                            Mapping[Index, Tensor]],
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
+    """Compute neuron scores for a given node, given sensitivity and bounds.
+
+    This implements Equation (9) in "Branch and Bound for Piecewise Linear
+    Neural Network Verification", https://arxiv.org/pdf/1909.06588.pdf.
+
+    Args:
+      scoring_inputs: Tuple composed of the results of the input analysis, the
+        statistics at that point of the branch-and-bound tree, as well as the
+        computed sensitivities
+    Returns:
+      scores: Scores for branching on each ReLU of the network.
+      branch_vals: Branching values for the ReLUs (always 0).
+    """
+    input_analysis, heuristic_inputs, sensitivities = scoring_inputs
+    _, _, graph_nodes, _, _, _ = input_analysis
+    bounds = heuristic_inputs['intermediate_bounds']
+    sign_preact_indices = primitive_preact_indices(
+        graph_nodes, [jax.lax.sign_p])
+
+    scores = {}
+    branch_vals = {}
+    for index in sign_preact_indices:
+      lower_bound, upper_bound = bounds[index]
+      sensitivity = sensitivities[index]
+
+      # Only consider 'ambiguous' sign: those whose input bounds straddle zero.
+      ambiguous = jnp.logical_and(lower_bound < 0., upper_bound > 0.)
+      scores[index] = jnp.where(ambiguous, 2*jnp.abs(sensitivity), -jnp.inf)
+      branch_vals[index] = jnp.zeros_like(lower_bound)
+
+    return scores, branch_vals
+
+
 class SensitivityReluSelector(SensitivitySelector):
   """Neuron selection strategy based on estimated influence on output objective.
   """
@@ -492,8 +537,8 @@ class SensitivityReluSelector(SensitivitySelector):
       self,
       scoring_inputs: Tuple[InputAnalysis,
                             BranchHeuristicInputs,
-                            Dict[Index, Tensor]],
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+                            Mapping[Index, Tensor]],
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     """Compute neuron scores for a given node, given sensitivity and bounds.
 
     This uses the sensitivity to estimate the impact of a change in what the K&W
@@ -520,8 +565,8 @@ class SensitivityReluSelector(SensitivitySelector):
         computed sensitivities
     Returns:
       scores: Scores for branching on each ReLU of the network.
-      branch_vals: None, which by default corresponds to branching over the zero
-        values.
+      branch_vals: Tensor of zero values, as this is the value over which ReLU
+        branch.
     """
 
     input_analysis, heuristic_inputs, sensitivities = scoring_inputs
@@ -577,8 +622,8 @@ class SensitivityLinfSelector(SensitivitySelector):
       self,
       scoring_inputs: Tuple[InputAnalysis,
                             BranchHeuristicInputs,
-                            Dict[Index, Tensor]],
-  ) -> Tuple[Dict[Index, Tensor], Optional[Dict[Index, BranchVal]]]:
+                            Mapping[Index, Tensor]],
+  ) -> Tuple[Mapping[Index, Tensor], Mapping[Index, BranchVal]]:
     """Compute Input branching scores given sensitivity and bounds.
 
     This only relies on the sensitivity of the output node and ignores the
@@ -618,7 +663,7 @@ class SensitivityLinfSelector(SensitivitySelector):
       improvement = jnp.abs(sensitivity) * (upper_bound - lower_bound) / 2
 
       scores[index] = jnp.where(unfixed, improvement, -jnp.inf)
-      branch_vals[index] = 0.5 + (lower_bound + upper_bound)
+      branch_vals[index] = 0.5 * (lower_bound + upper_bound)
 
     return scores, branch_vals
 
@@ -637,10 +682,10 @@ def aggregate_ambiguities(
 
 def bound_input_info(
     *init_bound: Nest[graph_traversal.GraphInput],
-) -> Dict[str, Any]:
+) -> Mapping[str, Any]:
   """Returns useful information on inputs suitable for branching."""
 
-  is_bound = lambda b: isinstance(b, InputBound)
+  is_bound = lambda b: isinstance(b, graph_traversal.InputBound)
   input_count = 0
   index = graph_traversal.IndexCounter()
 
@@ -665,38 +710,10 @@ def bound_input_info(
   }
 
 
-def _select_highest_scoring_neuron(
-    scores: Dict[Index, Tensor]) -> Optional[Tuple[Index, int]]:
-  """Identifies the most fitting neuron on which to branch.
-
-  Args:
-    scores: Scores for neurons in candidate graph nodes, indicating
-      fitness for branching.
-
-  Returns:
-    `None` if no suitable neuron found, otherwise:
-    index: Node containing the selected neuron.
-    neuron_idx: Location within the flattened tensor of the selected neuron.
-  """
-  indices, flat_scores = zip(*scores.items())
-
-  # Select the pre-activation neuron with the greatest ambiguity.
-  # First select the node.
-  max_scores = [jnp.amax(score) for score in flat_scores]
-  argmax = jnp.argmax(jnp.array(max_scores))
-  index = indices[argmax]
-  if max_scores[argmax] == -jnp.inf:
-    return None  # No feasible branching
-
-  # Next select the highest-scoring neuron within that node.
-  neuron_idx = jnp.argmax(flat_scores[argmax])
-  return jax.device_get(index), jax.device_get(neuron_idx)
-
-
 def computation_graph_nodes(
-    spec_fn: Callable[..., Tensor],
-    *init_bound: Nest[GraphInput],
-) -> Dict[Index, bound_utils.GraphNode]:
+    spec_fn: SpecFn,
+    *init_bound: Nest[graph_traversal.GraphInput],
+) -> Mapping[Index, bound_utils.GraphNode]:
   """Extract a mapping from index to primitives."""
   inspector = bound_utils.GraphInspector()
   bound_propagation.bound_propagation(
@@ -705,9 +722,10 @@ def computation_graph_nodes(
   return inspector.nodes
 
 
-def primitive_preact_indices(graph_nodes: Dict[Index, bound_utils.GraphNode],
-                             target_primitives: Sequence[jax.core.Primitive],
-                             ) -> Sequence[Index]:
+def primitive_preact_indices(
+    graph_nodes: Mapping[Index, bound_utils.GraphNode],
+    target_primitives: Sequence[Primitive],
+) -> Sequence[Index]:
   """Extract the index of the input to the required primitives."""
   preact_indices = []
   for _, node in graph_nodes.items():
@@ -716,16 +734,41 @@ def primitive_preact_indices(graph_nodes: Dict[Index, bound_utils.GraphNode],
   return preact_indices
 
 
+@jax.jit
+def identify_highest_scoring_neuron(
+    all_scores: Sequence[Tensor]
+)-> Tuple[float, int, int]:
+  """Identifies the most fitting neuron on which to branch.
+
+  Args:
+    all_scores: Scores for neurons in candidate graph nodes, indicating
+      fitness for branching.
+
+  Returns:
+    max_score: score of the highest scoring neuron.
+    node_pos: Position of the node containing the highest scoring neuron.
+    neuron_idx: Location within the flattened tensor of the selected neuron.
+  """
+  # Select the pre-activation neuron with the greatest ambiguity.
+  # First select the node.
+  all_max_scores = jnp.array([jnp.amax(score) for score in all_scores])
+  all_neuron_index = jnp.array([jnp.argmax(score) for score in all_scores])
+  max_score = jnp.amax(all_max_scores)
+  node_pos = jnp.argmax(all_max_scores)
+  # Next select the highest-scoring neuron within that node.
+  neuron_idx = all_neuron_index[node_pos]
+  return max_score, node_pos, neuron_idx
+
+
 def highest_score_branch_plane(
-    scores: Dict[Index, Tensor],
-    branch_vals: Optional[Dict[Index, BranchVal]],
+    scores: Mapping[Index, Tensor],
+    branch_vals: Mapping[Index, BranchVal],
 ) -> Optional[BranchPlane]:
   """Determines the neuron on which to branch.
 
   Args:
     scores: Score for each graph node.
-    branch_vals: Critical values of all neurons for each graph node. If `None`
-      then simply use zero for all critical values.
+    branch_vals: Critical values of all neurons for each graph node.
 
   Returns:
     `None` if no suitable neuron found, otherwise:
@@ -733,48 +776,54 @@ def highest_score_branch_plane(
     neuron_index: Location within the flattened tensor of the selected neuron.
     branch_val: Critical value of the selected neuron on which to branch.
   """
-  indices = _select_highest_scoring_neuron(scores)
-  if indices is None:
+  indices, flat_scores = zip(*scores.items())
+  max_score, max_index, neuron_idx = identify_highest_scoring_neuron(
+      flat_scores)
+  index = indices[max_index]
+
+  if max_score == -jnp.inf:
     return None
-  index, neuron_idx = indices
   return make_branch_plane(index, neuron_idx, branch_vals)
+
+
+@jax.jit
+def get_branch_vals(
+    neuron_idx: int,
+    branch_vals: BranchVal
+) -> Tuple[float, float]:
+  """Get the lower and upper branching values associated with a neuron index."""
+  neuron_branch_val = lambda bvals: jnp.reshape(bvals, (-1,))[neuron_idx]
+
+  if isinstance(branch_vals, tuple):
+    lower_branch_vals, upper_branch_vals = branch_vals
+  else:
+    lower_branch_vals = upper_branch_vals = branch_vals
+
+  lower_branch_val = neuron_branch_val(lower_branch_vals)
+  upper_branch_val = neuron_branch_val(upper_branch_vals)
+
+  return lower_branch_val, upper_branch_val
 
 
 def make_branch_plane(
     index: Index,
     neuron_idx: int,
-    branch_vals: Optional[Dict[Index, BranchVal]],
+    branch_vals: Mapping[Index, BranchVal],
 ) -> BranchPlane:
   """Returns branch plane with the specified content."""
 
-  def neuron_branch_val(branch_vals):
-    if jnp.isscalar(branch_vals):
-      return branch_vals
-    else:
-      flat_branch_vals = jnp.reshape(branch_vals, (-1,))
-      return flat_branch_vals[neuron_idx]
-
-  if branch_vals is not None:
-    index_branch_vals = branch_vals[index]
-    if isinstance(index_branch_vals, tuple):
-      lower_branch_vals, upper_branch_vals = index_branch_vals
-    else:
-      lower_branch_vals = upper_branch_vals = index_branch_vals
-
-    lower_branch_val = neuron_branch_val(lower_branch_vals)
-    upper_branch_val = neuron_branch_val(upper_branch_vals)
-  else:
-    # This is the common default case, applicable to ReLUs.
-    lower_branch_val = upper_branch_val = 0.
+  index_branch_vals = branch_vals[index]
+  lower_branch_val, upper_branch_val = get_branch_vals(neuron_idx,
+                                                       index_branch_vals)
   return BranchPlane(
       BranchDecision(index, neuron_idx, lower_branch_val, -1),
       BranchDecision(index, neuron_idx, upper_branch_val, 1))
 
 
 def concrete_branch_bounds(
-    root_bounds: Dict[Index, Tuple[Tensor, Tensor]],
+    root_bounds: Mapping[Index, Tuple[Tensor, Tensor]],
     branching_decisions: BranchingDecisionList,
-) -> Dict[Index, Tuple[Tensor, Tensor]]:
+) -> Mapping[Index, Tuple[Tensor, Tensor]]:
   """Materialises a branch's decision path as concrete interval bounds.
 
   Args:
@@ -788,9 +837,9 @@ def concrete_branch_bounds(
   for node, neuron_idx, branch_val, side in branching_decisions:
     lower, upper = branch_bounds[node]
     if side > 0:
-      lower = _set_element(lower, neuron_idx, branch_val)
+      lower = _set_element(lower, neuron_idx, branch_val)  # pytype: disable=wrong-arg-types  # jax-ndarray
     else:
-      upper = _set_element(upper, neuron_idx, branch_val)
+      upper = _set_element(upper, neuron_idx, branch_val)  # pytype: disable=wrong-arg-types  # jax-ndarray
     branch_bounds[node] = lower, upper
   return branch_bounds
 
@@ -804,14 +853,30 @@ def _set_element(x: Tensor, i: int, v: Tensor) -> Tensor:
 
 
 def max_index_depth(
-    spec_fn: Callable[[Nest[Tensor]], Nest[Tensor]],
-    *input_bounds: GraphInput) -> int:
+    spec_fn: SpecFn,
+    *input_bounds: graph_traversal.GraphInput) -> int:
   """Geth the maximum number of integers to use to identify a node."""
   inspector = bound_utils.GraphInspector()
   bound_propagation.bound_propagation(
       bound_propagation.ForwardPropagationAlgorithm(inspector),
       spec_fn, *input_bounds)
   return max(len(node.index) for node in inspector.nodes.values())
+
+
+def split_branching_decisions(
+    branching_decisions: BranchingDecisionList,
+    index_to_input: Mapping[Index, int],
+) -> Tuple[BranchingDecisionList, BranchingDecisionList]:
+  """Split branching decisions into activation based and input based."""
+
+  activation_branching_decisions = []
+  input_branching_decisions = []
+  for branch_dec in branching_decisions:
+    if branch_dec.node_index in index_to_input:
+      input_branching_decisions.append(branch_dec)
+    else:
+      activation_branching_decisions.append(branch_dec)
+  return activation_branching_decisions, input_branching_decisions
 
 
 def branching_decisions_tensors(
@@ -847,10 +912,8 @@ def branching_decisions_tensors(
     is_upper_branch.append(side > 0)
 
   # Pad the tensors to one of the accepted lengths.
-  factor = len(branching_decisions) / initial_max_branching_depth
-  safe_factor = max(1, factor)
-  next_2pow = math.ceil(math.log2(safe_factor))
-  tensor_len = initial_max_branching_depth * (2 ** next_2pow)
+  tensor_len = target_pad_length(len(branching_decisions),
+                                 initial_max_branching_depth)
 
   while len(node_indices) < tensor_len:
     node_indices.append((0,)*max_idx_depth)
@@ -865,10 +928,143 @@ def branching_decisions_tensors(
       jnp.array(is_upper_branch, dtype=jnp.bool_))
 
 
+def target_pad_length(actual_length: int, pad_scale: int) -> int:
+  factor = actual_length / pad_scale
+  safe_factor = max(1, factor)
+  next_2pow = math.ceil(math.log2(safe_factor))
+  return int(pad_scale * (2 ** next_2pow))
+
+
+def branch_inputs(
+    input_branching_decisions: BranchingDecisionList,
+    *input_bounds: Nest[graph_traversal.GraphInput],
+) -> Nest[graph_traversal.GraphInput]:
+  """Split input domain according to input branching decisions.
+
+  Args:
+    input_branching_decisions: Specifies a branch's decision path.
+    *input_bounds: Original input domain.
+
+  Returns:
+    Copy of input_bounds, refined according to the current branch constraints,
+  """
+  is_bound = lambda b: isinstance(b, graph_traversal.InputBound)
+  input_bounds = bound_propagation.unjit_inputs(*input_bounds)
+  flat_bounds, _ = jax.tree_util.tree_flatten(input_bounds, is_leaf=is_bound)
+
+  per_input_lower_decisions = collections.defaultdict(list)
+  per_input_upper_decisions = collections.defaultdict(list)
+  for (node, neuron_idx, branch_val, side) in input_branching_decisions:
+    if side > 0:
+      # This decision modifies the lower bound.
+      per_input_lower_decisions[node].append((neuron_idx, branch_val))
+    else:
+      # This decision modifies the upper bound.
+      per_input_upper_decisions[node].append((neuron_idx, branch_val))
+
+  index = graph_traversal.IndexCounter()
+  new_flat_bounds = []
+  for bound in flat_bounds:
+    if is_bound(bound):
+      node_lower_decs = per_input_lower_decisions[index.as_tuple()]
+      if node_lower_decs:
+        lower_n_indices, lower_branch_vals = zip(*node_lower_decs)
+        lower_tensor_len = target_pad_length(len(lower_n_indices), 4)
+        lower_to_pad = lower_tensor_len - len(lower_n_indices)
+        lower_n_indices = lower_n_indices + (0,) * lower_to_pad
+        lower_branch_vals = lower_branch_vals + (-jnp.inf,) * lower_to_pad
+        new_lower = _impose_constraints('max', bound.lower,
+                                        jnp.array(lower_n_indices),
+                                        jnp.array(lower_branch_vals))
+      else:
+        new_lower = bound.lower
+
+      node_upper_decs = per_input_upper_decisions[index.as_tuple()]
+      if node_upper_decs:
+        upper_n_indices, upper_branch_vals = zip(*node_upper_decs)
+        upper_tensor_len = target_pad_length(len(upper_n_indices), 4)
+        upper_to_pad = upper_tensor_len - len(upper_n_indices)
+        upper_n_indices = upper_n_indices + (0,) * upper_to_pad
+        upper_branch_vals = upper_branch_vals + (jnp.inf,) * upper_to_pad
+        new_upper = _impose_constraints('min', bound.upper,
+                                        jnp.array(upper_n_indices),
+                                        jnp.array(upper_branch_vals))
+      else:
+        new_upper = bound.upper
+
+      if isinstance(bound, bound_propagation.IntervalBound):
+        new_flat_bounds.append(bound_propagation.IntervalBound(
+            new_lower, new_upper))
+      else:
+        raise ValueError('Unknown input bound type for branching.')
+
+      index.incr()
+    else:
+      new_flat_bounds.append(bound)
+
+  new_input_bounds = jax.tree_util.tree_unflatten(
+      jax.tree_util.tree_structure(input_bounds, is_leaf=is_bound),
+      new_flat_bounds)
+  return new_input_bounds
+
+
+@jax.jit
+def infeasible_bounds(*input_bounds: Nest[bound_propagation.JittableGraphInput]
+                      ) -> bool:
+  """Return whether there is any infeasibility in a set of bounds."""
+  is_bound = lambda b: isinstance(b, bound_propagation.Bound)
+  input_bounds = bound_propagation.unjit_inputs(input_bounds)
+  flat_inputs, _ = jax.tree_util.tree_flatten(input_bounds, is_bound)
+  infeasible = False
+  for inp in flat_inputs:
+    if isinstance(inp, jnp.ndarray):
+      pass
+    elif is_bound(inp):
+      # Anything that is a bound should be checked for crossing between lower
+      # and upper bound.
+      infeasible = jnp.logical_or(infeasible, bounds_crossing(inp))
+    else:
+      raise ValueError('Unknown type of input.')
+
+  return infeasible  # pytype: disable=bad-return-type  # jax-types
+
+
+def bounds_crossing(bound: bound_propagation.Bound, tol: float = 1e-6) -> bool:
+  """Return a boolean tensor indicating whether any bounds are crossing."""
+  return (bound.upper - bound.lower < -tol).any()
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def _impose_constraints(update_rule: str,
+                        ini_tensor: Tensor,
+                        indices: Tensor,
+                        values: Tensor) -> Tensor:
+  """Impose a set of constraints over various coordinates of a tensor.
+
+  Args:
+    update_rule: Either 'min' or 'max', indicate how to modify the given tensor.
+    ini_tensor: Tensor to update.
+    indices: Coordinates of the tensor that we are imposing constraints on.
+    values: Values of the constraint that we are imposing.
+  Returns:
+    updated_tensor
+  """
+  shape = ini_tensor.shape
+  flat_tensor = jnp.reshape(ini_tensor, (-1,))
+  to_update = flat_tensor.at[indices]
+  if update_rule == 'max':
+    updated_flat_tensor = to_update.max(values)
+  elif update_rule == 'min':
+    updated_flat_tensor = to_update.min(values)
+  else:
+    raise ValueError('Unknown update rule.')
+  return jnp.reshape(updated_flat_tensor, shape)
+
+
 def enforce_jittable_branching_decisions(
     branching_decisions: JittableBranchingDecisions,
-    index: Index, bound: Bound,
-) -> Bound:
+    index: Index, bound: bound_propagation.Bound,
+) -> bound_propagation.Bound:
   """Ensure that a bound is consistent with a list of branching decisions.
 
   Args:

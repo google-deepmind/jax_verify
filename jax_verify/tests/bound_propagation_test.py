@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -129,11 +129,12 @@ class BoundPropagationTest(parameterized.TestCase):
     # Because the input lower bound is equal to the input upper bound, the value
     # of the output bounds should be the same and correspond to the value of the
     # forward pass.
-    self.assertAlmostEqual(tight_output_bounds.lower.tolist(),
-                           tight_output_bounds.upper.tolist())
-
-    self.assertAlmostEqual(tight_output_bounds.lower.tolist(),
-                           model_eval.tolist())
+    self.assertAlmostEqual(jnp.abs(tight_output_bounds.upper
+                                   - tight_output_bounds.lower).max(), 0.,
+                           delta=1e-6)
+    self.assertAlmostEqual(jnp.abs(tight_output_bounds.lower
+                                   - model_eval).max(), 0.,
+                           delta=1e-6)
 
   @parameterized.named_parameters(
       ('Sequential', sequential_model),

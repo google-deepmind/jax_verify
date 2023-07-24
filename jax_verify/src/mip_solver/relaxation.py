@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,24 +20,24 @@ and translating the computational graph.
 """
 import abc
 import functools
-from typing import Callable, Tuple, Dict, Union, List, Optional
+from typing import Callable, Tuple, List, Mapping, Optional, Union
 
 import jax
 from jax import lax
 import jax.numpy as jnp
 from jax_verify.src import activation_relaxation
 from jax_verify.src import bound_propagation
+from jax_verify.src import graph_traversal
 from jax_verify.src import ibp
 from jax_verify.src import synthetic_primitives
+from jax_verify.src.types import Index, Primitive, Tensor  # pylint: disable=g-multiple-import
 import numpy as np
-
-Tensor = jnp.ndarray
 
 
 class RelaxVariable(bound_propagation.Bound):
   """Variable used to build relaxation."""
 
-  def __init__(self, idx: bound_propagation.Index, base_bound):
+  def __init__(self, idx: Index, base_bound):
     self.base_bound = base_bound
     self.name = 'rlxvar'
     for idx_cpt in idx:
@@ -72,6 +72,12 @@ class OptRelaxVariable(RelaxVariable):
     # Need to specify a shape method, because otherwise, a call to `.shape`
     # will attempt to read `.lower` and trigger optimization
     return self._shape
+
+  @property
+  def dtype(self):
+    # Need to specify a type method, because otherwise, a call to `.dtype`
+    # will attempt to read `.lower` and trigger optimization
+    return self._dtype
 
   @property
   def lower(self):
@@ -240,7 +246,7 @@ class RelaxationSolver(metaclass=abc.ABCMeta):
   def _variable_already_created(
       self,
       var: Union[RelaxVariable, BinaryVariable],
-      ) -> bool:
+  ) -> bool:
     """Check whether the solver has already created a variable for var.
 
     Args:
@@ -283,7 +289,7 @@ class RelaxationSolver(metaclass=abc.ABCMeta):
       objective: Tensor,
       objective_bias: float,
       time_limit_millis: Optional[int],
-  ) -> Tuple[float, Dict[str, Tensor], bool]:
+  ) -> Tuple[float, Mapping[str, Tensor], bool]:
     """Minimize a linear function.
 
     Args:
@@ -352,7 +358,7 @@ class MIPSolver(RelaxationSolver):
 
 def encode_relaxation(
     solver_ctor: Callable[[], RelaxationSolver],
-    env: Dict[jax.core.Var, Union[RelaxVariable, Tensor]],
+    env: Mapping[jax.core.Var, Union[RelaxVariable, Tensor]],
     index: int,
 ) -> RelaxationSolver:
   """Creates a solver and encodes the relaxation into it.
@@ -387,10 +393,10 @@ def solve_relaxation(
     objective: Tensor,
     objective_bias: float,
     variable_opt: RelaxVariable,
-    env: Dict[jax.core.Var, Union[RelaxVariable, Tensor]],
+    env: Mapping[jax.core.Var, Union[RelaxVariable, Tensor]],
     index: int,
     time_limit_millis: Optional[int] = None,
-) -> Tuple[float, Dict[str, Tensor], bool]:
+) -> Tuple[float, Mapping[str, Tensor], bool]:
   """Solves the relaxation using the provided LP solver.
 
   Args:
@@ -453,7 +459,7 @@ def _get_linear(primitive, outval, *eqn_invars, **params):
 
 
 def _relax_input(
-    index: bound_propagation.Index, in_bounds: bound_propagation.Bound,
+    index: Index, in_bounds: bound_propagation.Bound,
 ) -> RelaxVariable:
   """Generates the initial inputs for the relaxation.
 
@@ -469,18 +475,18 @@ def _relax_input(
 
 
 _order_preserving_reshapes = [lax.reshape_p, lax.squeeze_p]
-_affine_primitives_list = (
-    bound_propagation.AFFINE_PRIMITIVES +
-    bound_propagation.RESHAPE_PRIMITIVES +
-    [lax.div_p]
-)
+_affine_primitives_list = [
+    *bound_propagation.AFFINE_PRIMITIVES,
+    *bound_propagation.RESHAPE_PRIMITIVES,
+    lax.div_p,
+]
 
 
 def _relax_primitive(
-    index: bound_propagation.Index, out_bounds: bound_propagation.Bound,
-    primitive: jax.core.Primitive,
+    index: Index, out_bounds: bound_propagation.Bound,
+    primitive: Primitive,
     *args, use_mip: bool = False, **kwargs
-    ) -> RelaxVariable:
+) -> RelaxVariable:
   """Generates the relaxation for a given primitive op.
 
   Args:
@@ -597,7 +603,7 @@ def _relax_primitive(
   return out_variable
 
 
-class RelaxationTransform(bound_propagation.GraphTransform[RelaxVariable]):
+class RelaxationTransform(graph_traversal.GraphTransform[RelaxVariable]):
   """Transform to produce `RelaxVariable`s for each op."""
 
   def __init__(
@@ -624,7 +630,7 @@ class RelaxationTransform(bound_propagation.GraphTransform[RelaxVariable]):
   def primitive_transform(self, context, primitive, *args, **params):
     interval_args = [arg.base_bound if isinstance(arg, RelaxVariable) else arg
                      for arg in args]
-    out_bounds = self._boundprop_transform.equation_transform(
+    out_bounds, = self._boundprop_transform.equation_transform(
         context, primitive, *interval_args, **params)
     return _relax_primitive(
         context.index, out_bounds, primitive, *args,
@@ -632,12 +638,12 @@ class RelaxationTransform(bound_propagation.GraphTransform[RelaxVariable]):
 
 
 class OptimizedRelaxationTransform(
-    bound_propagation.GraphTransform[OptRelaxVariable]):
+    graph_traversal.GraphTransform[OptRelaxVariable]):
   """Wraps a RelaxVariable-producing BoundTransform to add optimization."""
 
   def __init__(
       self,
-      transform: bound_propagation.GraphTransform[RelaxVariable],
+      transform: graph_traversal.GraphTransform[RelaxVariable],
       solver_ctor: Callable[[], RelaxationSolver],
       time_limit_millis: Optional[int] = None):
     self._transform = transform
@@ -680,8 +686,8 @@ class OptimizedRelaxationTransform(
 
   def input_transform(
       self,
-      context: bound_propagation.TransformContext,
-      input_bound: bound_propagation.InputBound,
+      context: graph_traversal.TransformContext[OptRelaxVariable],
+      input_bound: graph_traversal.InputBound,
   ) -> RelaxVariable:
     in_bounds = self._transform.input_transform(
         context, input_bound)
@@ -696,12 +702,12 @@ class OptimizedRelaxationTransform(
 
   def primitive_transform(
       self,
-      context: bound_propagation.TransformContext,
-      primitive: jax.core.Primitive,
+      context: graph_traversal.TransformContext[OptRelaxVariable],
+      primitive: Primitive,
       *args: Union[RelaxVariable, Tensor],
       **params,
   ) -> RelaxVariable:
-    basic_relax_var = self._transform.equation_transform(
+    basic_relax_var, = self._transform.equation_transform(
         context, primitive, *args, **params)
     opt_relax_var = OptRelaxVariable(basic_relax_var, self)
 

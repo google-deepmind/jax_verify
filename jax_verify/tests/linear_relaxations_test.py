@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ class LinearRelaxationsTest(parameterized.TestCase):
   def test_convex_fn_relaxes_with_upper_chord(self, primitive, fn, shift):
     parameterized_relaxer = linear_relaxations.parameterized_relaxer
     linearizer = parameterized_relaxer.parameterized_linearizer(
-        (), primitive, [4])
+        (), primitive, ([4], True))
     chex.assert_equal(linearizer.arity, 1)
 
     lb = jnp.array([0., -1., -1., -1.]) + shift
@@ -78,7 +78,7 @@ class LinearRelaxationsTest(parameterized.TestCase):
       self, primitive, convex_relaxation):
     parameterized_relaxer = linear_relaxations.parameterized_relaxer
     linearizer = parameterized_relaxer.parameterized_linearizer(
-        (), primitive, [4])
+        (), primitive, ([4], True))
     chex.assert_equal(linearizer.arity, 1)
 
     lb = jnp.array([0., -1., -1., -1.])
@@ -126,7 +126,7 @@ class LinearRelaxationsTest(parameterized.TestCase):
       self, primitive, fn, params):
     parameterized_relaxer = linear_relaxations.parameterized_relaxer
     linearizer = parameterized_relaxer.parameterized_linearizer(
-        (), primitive, [6], **params)
+        (), primitive, ([6], True), **params)
     chex.assert_equal(linearizer.arity, 1)
 
     lb = jnp.array([0., -1., -1., -1., -3.5, 2.1])

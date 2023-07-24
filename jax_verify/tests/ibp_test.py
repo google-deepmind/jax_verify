@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,6 +52,11 @@ class IBPTest(parameterized.TestCase):
     self.assertAlmostEqual(5., output_bounds.lower)
     self.assertAlmostEqual(11., output_bounds.upper)
 
+    fused_output_bounds = jax_verify.interval_bound_propagation(
+        fun, input_bounds, fused_linear=True)
+    self.assertAlmostEqual(5., fused_output_bounds.lower)
+    self.assertAlmostEqual(11., fused_output_bounds.upper)
+
   def test_conv1d_ibp(self):
 
     def conv1d_model(inp):
@@ -73,6 +78,12 @@ class IBPTest(parameterized.TestCase):
     self.assertAlmostEqual(7., output_bounds.lower, delta=1e-5)
     self.assertAlmostEqual(11., output_bounds.upper, delta=1e-5)
 
+    fused_output_bounds = jax_verify.interval_bound_propagation(
+        fun, input_bounds, fused_linear=True)
+
+    self.assertAlmostEqual(7., fused_output_bounds.lower, delta=1e-5)
+    self.assertAlmostEqual(11., fused_output_bounds.upper, delta=1e-5)
+
   def test_conv2d_ibp(self):
     def conv2d_model(inp):
       return hk.Conv2D(output_channels=1, kernel_shape=(2, 2),
@@ -93,13 +104,24 @@ class IBPTest(parameterized.TestCase):
     self.assertAlmostEqual(8., output_bounds.lower)
     self.assertAlmostEqual(16., output_bounds.upper)
 
+    fused_output_bounds = jax_verify.interval_bound_propagation(
+        fun, input_bounds, fused_linear=True)
+
+    self.assertAlmostEqual(8., fused_output_bounds.lower)
+    self.assertAlmostEqual(16., fused_output_bounds.upper)
+
   @parameterized.named_parameters(
-      ('exp', jnp.exp, [[-2., 3.]]),
-      ('log', jnp.log, [[3., 5.]]),
-      ('relu', jax.nn.relu, [[-2., 3.]]),
-      ('softplus', jax.nn.softplus, [[-2., 3.]]),
-      ('sign', jnp.sign, [[-2., 3.]]),
-      ('sigmoid', jax.nn.sigmoid, [[-2., 3.]]),
+      ('exp', jnp.exp, [[-2.0, 3.0]]),
+      ('log', jnp.log, [[3.0, 5.0]]),
+      ('relu', jax.nn.relu, [[-2.0, 3.0]]),
+      ('softplus', jax.nn.softplus, [[-2.0, 3.0]]),
+      ('sign', jnp.sign, [[-2.0, 3.0]]),
+      ('sigmoid', jax.nn.sigmoid, [[-2.0, 3.0]]),
+      (
+          'dynamic_slice',
+          lambda x: jax.lax.dynamic_slice(x, (1, 2, 3), (2, 1, 1)),
+          np.arange(24).reshape((2, 3, 4)),
+      ),
   )
   def test_passthrough_primitive(self, fn, inputs):
     z = jnp.array(inputs)
@@ -109,13 +131,22 @@ class IBPTest(parameterized.TestCase):
     self.assertArrayAlmostEqual(fn(input_bounds.lower), output_bounds.lower)
     self.assertArrayAlmostEqual(fn(input_bounds.upper), output_bounds.upper)
 
+  def test_ibp_neg(self):
+    fn = lambda x: -x
+
+    input_bounds = jax_verify.IntervalBound(jnp.zeros((2,)), jnp.ones((2,)))
+    output_bounds = jax_verify.interval_bound_propagation(fn, input_bounds)
+
+    self.assertArrayAlmostEqual(output_bounds.lower, -jnp.ones((2,)))
+    self.assertArrayAlmostEqual(output_bounds.upper, jnp.zeros((2,)))
+
   @parameterized.named_parameters(
       ('positive', (1.0, 4.0), (1.0, 2.0)),
       ('negative', (-4.0, -1.0), (float('nan'), float('nan'))),
       ('zero_edge', (0.0, 1.0), (0.0, 1.0)),
       ('zero_cross', (-1.0, 1.0), (float('nan'), 1.0)))
   def test_sqrt(self, input_bounds, expected):
-    input_bounds = jax_verify.IntervalBound(
+    input_bounds = jax_verify.IntervalBound(  # pytype: disable=wrong-arg-types  # jax-ndarray
         np.array([input_bounds[0], 0.0]), np.array([input_bounds[1], 0.0]))
     output_bounds = jax_verify.interval_bound_propagation(
         jnp.sqrt, input_bounds)

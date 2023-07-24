@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -140,12 +140,12 @@ class AttacksTest(parameterized.TestCase):
 
     # forward again gives the same result
     out_1_again = value_and_grad_fn(self.data_spec.input, next(self.prng_seq))
-    chex.assert_tree_all_close(out_1, out_1_again, rtol=1e-5)
+    chex.assert_trees_all_close(out_1, out_1_again, rtol=1e-5)
 
     # forward with 3 samples should still give the same result
     value_and_grad_fn = self._make_value_and_grad(params, num_samples=3)
     out_3 = value_and_grad_fn(self.data_spec.input, next(self.prng_seq))
-    chex.assert_tree_all_close(out_3, out_1, rtol=1e-5)
+    chex.assert_trees_all_close(out_3, out_1, rtol=1e-5)
 
   def _check_stochastic_behavior(self, params):
     value_and_grad_fn = self._make_value_and_grad(params, num_samples=2)
@@ -157,13 +157,13 @@ class AttacksTest(parameterized.TestCase):
     # forward with a different seed does not give the same result
     out_2_diff = value_and_grad_fn(self.data_spec.input, next(self.prng_seq))
     with self.assertRaises(AssertionError):
-      chex.assert_tree_all_close(out_2, out_2_diff)
+      chex.assert_trees_all_close(out_2, out_2_diff)
 
     # forward with 3 samples and the same prng is not the same
     value_and_grad_fn = self._make_value_and_grad(params, num_samples=3)
     out_3_same_prng = value_and_grad_fn(self.data_spec.input, prng)
     with self.assertRaises(AssertionError):
-      chex.assert_tree_all_close(out_2, out_3_same_prng)
+      chex.assert_trees_all_close(out_2, out_3_same_prng)
 
 
 if __name__ == '__main__':

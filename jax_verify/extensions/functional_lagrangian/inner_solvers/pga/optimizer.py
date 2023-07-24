@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ class IteratedFGSM:
       gradients: chex.Array,
       state: chex.Array,
   ) -> Tuple[chex.Array, chex.Array]:
-    return learning_rate.astype(gradients.dtype) * gradients, state
+    return learning_rate.astype(gradients.dtype) * gradients, state  # pytype: disable=attribute-error  # numpy-scalars
 
 
 class PGD:
@@ -146,7 +146,7 @@ class Restarted:
     if not self._has_batch_dim:
       opt_inputs = self._wrapped_optimizer(loss_fn, rng, inputs)
       opt_losses = loss_fn(opt_inputs)
-      return opt_inputs, opt_losses
+      return opt_inputs, opt_losses  # pytype: disable=bad-return-type  # numpy-scalars
 
     # Tile the inputs and labels.
     batch_size = inputs.shape[0]

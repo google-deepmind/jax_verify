@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -55,7 +55,8 @@ class AbstractParams(abc.ABC):
     """Forward pass on layer."""
     return sdp_utils.fwd(inputs, self.params)
 
-  @abc.abstractproperty
+  @property
+  @abc.abstractmethod
   def params(self):
     """Representation of params with sdp_utils.fwd convention."""
 
@@ -142,7 +143,7 @@ class InnerVerifInstance:
   """Specification of inner problems."""
 
   affine_fns: List[Callable[[Array], Array]]
-  bounds: IntervalBound
+  bounds: List[sdp_utils.IntervalBound]
 
   lagrangian_form_pre: Optional[LagrangianForm]
   lagrangian_form_post: Optional[LagrangianForm]

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -89,6 +89,18 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     self.assertArrayAlmostEqual(8., output_bounds.lower)
     self.assertArrayAlmostEqual(16., output_bounds.upper)
 
+  def test_dynamic_slice(self):
+    z = jnp.arange(24).reshape((2, 3, 4))
+    fun = lambda x: jax.lax.dynamic_slice(x, (1, 2, 3), (2, 1, 1))
+    input_bounds = jax_verify.IntervalBound(z - 1., z + 1.)
+
+    output_bounds = jax_verify.backward_crown_bound_propagation(
+        fun, input_bounds)
+    self.assertArrayAlmostEqual(output_bounds.lower,
+                                fun(input_bounds.lower))
+    self.assertArrayAlmostEqual(output_bounds.upper,
+                                fun(input_bounds.upper))
+
   def test_relu_crown(self):
     def relu_model(inp):
       return jax.nn.relu(inp)
@@ -143,10 +155,10 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     empirical_max = uniform_outs.max(axis=0)
 
     self.assertGreaterEqual((output_bounds.upper - empirical_max).min(), 0.,
-                            'Invalid upper bound for Exponential. The gap '
+                            'Invalid upper bound for LeakyReLU. The gap '
                             'between upper bound and empirical max is < 0')
     self.assertGreaterEqual((empirical_min - output_bounds.lower).min(), 0.,
-                            'Invalid lower bound for Exponential. The gap'
+                            'Invalid lower bound for LeakyRelu. The gap'
                             'between emp. min and lower bound is negative.')
 
   def test_exp_crown(self):
@@ -254,7 +266,7 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     bound, _ = bound_propagation.bound_propagation(
         algorithm, model, inp_bound)
 
-    np.testing.assert_array_almost_equal(bound.lower, bound.upper)
+    np.testing.assert_array_almost_equal(bound.lower, bound.upper)  # pytype: disable=attribute-error  # jax-ndarray
 
   def test_forwardconcretization_withbackwardalg_reference_out(self):
     architecture = [2, 4, 4, 2]
@@ -361,10 +373,10 @@ class BackwardCrownBoundTest(parameterized.TestCase):
     unchunked_bound, _ = bound_propagation.bound_propagation(
         unchunked_algorithm, model_fun, inp_bound)
 
-    np.testing.assert_array_almost_equal(chunked_bound.lower,
-                                         unchunked_bound.lower)
-    np.testing.assert_array_almost_equal(chunked_bound.upper,
-                                         unchunked_bound.upper)
+    np.testing.assert_array_almost_equal(chunked_bound.lower,  # pytype: disable=attribute-error  # jax-ndarray
+                                         unchunked_bound.lower)  # pytype: disable=attribute-error  # jax-ndarray
+    np.testing.assert_array_almost_equal(chunked_bound.upper,  # pytype: disable=attribute-error  # jax-ndarray
+                                         unchunked_bound.upper)  # pytype: disable=attribute-error  # jax-ndarray
 
 
 if __name__ == '__main__':

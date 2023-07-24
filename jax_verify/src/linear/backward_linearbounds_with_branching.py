@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ IsUpperBranch is a boolean tensor indicating if the inequality is
   neur > branch_val (True)
   neur < branch_val (False)
 """
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
 from jax import numpy as jnp
 
@@ -39,19 +39,8 @@ from jax_verify.src import optimizers
 from jax_verify.src.branching import branch_selection
 from jax_verify.src.linear import backward_crown
 from jax_verify.src.linear import linear_relaxations
+from jax_verify.src.types import Index, Nest, Primitive, SpecFn, Tensor  # pylint: disable=g-multiple-import
 import optax
-
-LinearExpression = linear_relaxations.LinearExpression
-Index = bound_propagation.Index
-Bound = bound_propagation.Bound
-GraphInput = bound_propagation.GraphInput
-Nest = bound_propagation.Nest
-Primitive = bound_propagation.Primitive
-Tensor = bound_propagation.Tensor
-LayerInput = bound_propagation.LayerInput
-LinearBoundBackwardConcretizingTransform = backward_crown.LinearBoundBackwardConcretizingTransform
-ParameterizedNodeRelaxation = backward_crown.ParameterizedNodeRelaxation
-JittableBranchingDecisions = branch_selection.JittableBranchingDecisions
 
 
 def _update_lin_with_lagrangian(eqn_lincoeffs: Tensor,
@@ -115,7 +104,7 @@ def _update_lin_with_lagrangian(eqn_lincoeffs: Tensor,
 
 
 class ConstrainedLinearBoundBackwardTransform(
-    LinearBoundBackwardConcretizingTransform):
+    backward_crown.LinearBoundBackwardConcretizingTransform):
   """Backward transformation adding the linear contributions from branching.
 
   Those contributions come from the defined branching decisions and the
@@ -124,12 +113,12 @@ class ConstrainedLinearBoundBackwardTransform(
 
   def __init__(
       self,
-      base_backward_transform: LinearBoundBackwardConcretizingTransform,
-      branching_decisions: JittableBranchingDecisions,
+      base_backward_transform: (
+          backward_crown.LinearBoundBackwardConcretizingTransform),
+      branching_decisions: branch_selection.JittableBranchingDecisions,
       lagrangian_variables: Tensor,
-      concretization_fn: Callable[
-          [LinearExpression, GraphInput],
-          Tensor] = backward_crown.concretize_backward_bound
+      concretization_fn: linear_relaxations.ConcretizationFn = (
+          linear_relaxations.concretize_linear_expression),
   ):
     super().__init__(concretization_fn)
     self._base_backward_transform = base_backward_transform
@@ -141,11 +130,13 @@ class ConstrainedLinearBoundBackwardTransform(
 
   def primitive_backtransform(
       self,
-      context: graph_traversal.TransformContext,
+      context: graph_traversal.TransformContext[
+          linear_relaxations.LinearExpression],
       primitive: Primitive,
-      eqn_outval: LinearExpression,
-      *args: LayerInput,
-      **params) -> Sequence[Sequence[Optional[LinearExpression]]]:
+      eqn_outval: linear_relaxations.LinearExpression,
+      *args: bound_propagation.LayerInput,
+      **params,
+  ) -> Sequence[Sequence[Optional[linear_relaxations.LinearExpression]]]:
 
     lay_idxs, neur_idxs, branch_val, is_upper = self._branching_decisions
     index = context.index
@@ -167,8 +158,8 @@ class ConstrainedLinearBoundBackwardTransform(
 
     # This new linear expression is equivalent to the initial linear expression
     # except that it now also include the contribution of the lagrangian.
-    lagrangianed_eqn_outval = LinearExpression(lagrangianed_lincoeffs,
-                                               lagrangianed_offset)
+    lagrangianed_eqn_outval = linear_relaxations.LinearExpression(
+        lagrangianed_lincoeffs, lagrangianed_offset)
     # We can now pass it on to the underlying primitive, to propagate backward.
     return self._base_backward_transform.primitive_backtransform(
         context, primitive, lagrangianed_eqn_outval, *args, **params)
@@ -204,13 +195,12 @@ class BranchedOptimizingLinearBoundBackwardTransform(
 
   def __init__(
       self,
-      branching_decisions: JittableBranchingDecisions,
+      branching_decisions: branch_selection.JittableBranchingDecisions,
       relaxer: linear_relaxations.ParameterizedLinearBoundsRelaxer,
       primitive_needs_concrete_bounds: Tuple[Primitive, ...],
       optimizer: optimizers.Optimizer,
-      concretization_fn: Callable[
-          [LinearExpression, GraphInput],
-          Tensor] = backward_crown.concretize_backward_bound
+      concretization_fn: linear_relaxations.ConcretizationFn = (
+          linear_relaxations.concretize_linear_expression),
   ):
     """Constructs a per-node concretizer that performs an inner optimisation.
 
@@ -229,8 +219,9 @@ class BranchedOptimizingLinearBoundBackwardTransform(
                      concretization_fn)
     self._branching_decisions = branching_decisions
 
-  def _initial_params(self, scanner, input_bounds
-                      ) -> Tuple[Dict[Index, Tensor], Tensor]:
+  def _initial_params(
+      self, scanner, input_bounds,
+  ) -> Tuple[Mapping[Index, Tensor], Tensor]:
     slope_params = super()._initial_params(scanner, input_bounds)
     dual_vars = jnp.zeros(self._branching_decisions[0].shape[0])
     return slope_params, dual_vars
@@ -243,9 +234,10 @@ class BranchedOptimizingLinearBoundBackwardTransform(
 
   def _bind(
       self,
-      node_relaxations: Dict[Index, ParameterizedNodeRelaxation],
-      all_params: Tuple[Dict[Index, Tensor], Tensor]
-  ) -> LinearBoundBackwardConcretizingTransform:
+      node_relaxations: Mapping[
+          Index, linear_relaxations.ParameterizedNodeRelaxation],
+      all_params: Tuple[Mapping[Index, Tensor], Tensor],
+  ) -> backward_crown.LinearBoundBackwardConcretizingTransform:
     slope_params, dual_vars = all_params
     base_backward_transform = super()._bind(node_relaxations, slope_params)
 
@@ -258,9 +250,10 @@ def lagrangian_backward_linear_compute_bounds(
     slope_optimizer: optax.GradientTransformation,
     lag_optimizer: optax.GradientTransformation,
     num_opt_steps: int,
-    function: Callable[..., Nest[Tensor]],
-    branching_decisions: JittableBranchingDecisions,
-    *bounds: Nest[GraphInput]) -> Nest[LayerInput]:
+    function: SpecFn,
+    branching_decisions: branch_selection.JittableBranchingDecisions,
+    *bounds: Nest[graph_traversal.GraphInput],
+) -> Nest[bound_propagation.LayerInput]:
   """Performs bound computation in the style of Beta-Crown.
 
   https://arxiv.org/abs/2103.06624

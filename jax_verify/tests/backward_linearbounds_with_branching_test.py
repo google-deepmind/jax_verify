@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -281,8 +281,8 @@ class LinearBoundBranchingTest(absltest.TestCase):
     nobranch_bound, _ = bound_propagation.bound_propagation(
         nobranch_algorithm, fun, inp_bound)
 
-    np.testing.assert_array_equal(reference_bound.upper, nobranch_bound.upper)
-    np.testing.assert_array_equal(reference_bound.lower, nobranch_bound.lower)
+    np.testing.assert_array_equal(reference_bound.upper, nobranch_bound.upper)  # pytype: disable=attribute-error  # jax-ndarray
+    np.testing.assert_array_equal(reference_bound.lower, nobranch_bound.lower)  # pytype: disable=attribute-error  # jax-ndarray
 
 
 if __name__ == '__main__':

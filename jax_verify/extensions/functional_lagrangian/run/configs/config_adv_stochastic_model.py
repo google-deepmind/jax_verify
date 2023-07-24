@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -124,7 +124,7 @@ def get_config(model_name='mnist_mlp_1_128'):
   # check adversary cannot bring loss below feasibility_margin
   config.problem.feasibility_margin = 0.0
 
-  config.problem.model_name = 'mnist_mlp_1_128'
+  config.problem.model_name = model_name
 
   config.dual = get_dual_config()
   config.attack = get_attack_config()

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,24 +18,23 @@
 
 import abc
 import functools
-from typing import Tuple, Callable, Dict, Optional, List, Union
+from typing import Tuple, Callable, Mapping, Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp
 
 from jax_verify.src import bound_propagation
+from jax_verify.src import graph_traversal
 from jax_verify.src import ibp
 from jax_verify.src import optimizers
 from jax_verify.src import utils
+from jax_verify.src.branching import branch_selection
 from jax_verify.src.nonconvex import nonconvex
+from jax_verify.src.types import Index, Tensor  # pylint: disable=g-multiple-import
 import optax
 
 
-Tensor = jnp.ndarray
-Index = bound_propagation.Index
 ParamSet = nonconvex.ParamSet
-BranchPlane = Tuple[Index, int, float]
-BranchConstraint = Tuple[BranchPlane, int]
 
 
 class BoundOptimizer(metaclass=abc.ABCMeta):
@@ -62,7 +61,8 @@ class OptimizingConcretizer(nonconvex.Concretizer):
   def __init__(
       self, optimizer: BoundOptimizer,
       max_parallel_nodes: int = 512,
-      branching_constraints: Optional[List[BranchConstraint]] = None,
+      branching_constraints: Optional[
+          branch_selection.BranchingDecisionList] = None,
       branching_optimizer: Optional[optax.GradientTransformation] = None,
       branching_opt_number_steps: int = 0):
     self._optimizer = optimizer
@@ -84,8 +84,8 @@ class OptimizingConcretizer(nonconvex.Concretizer):
 
   def concrete_bound(
       self,
-      graph: bound_propagation.PropagationGraph,
-      env: Dict[jax.core.Var, Union[bound_propagation.Bound, Tensor]],
+      graph: graph_traversal.PropagationGraph,
+      env: Mapping[jax.core.Var, Union[bound_propagation.Bound, Tensor]],
       nonconvex_bound: nonconvex.NonConvexBound) -> bound_propagation.Bound:
     return self.get_bounds(nonconvex_bound)
 
@@ -107,7 +107,7 @@ class OptimizingConcretizer(nonconvex.Concretizer):
         return bound_vals
 
       if any(node_idx <= to_opt_bound.index
-             for ((node_idx, *_), _) in self._branching_constraints):
+             for (node_idx, *_) in self._branching_constraints):
         # There exists constraints that needs to be taken into account.
 
         # The dual vars per constraint are scalars, but we need to apply them
@@ -116,16 +116,15 @@ class OptimizingConcretizer(nonconvex.Concretizer):
         # Create the dual variables for them.
         active_branching_constraints = [
             (node_idx, neuron_idx, val, side)
-            for (node_idx, neuron_idx, val), side in self._branching_constraints
-            if node_idx <= to_opt_bound.index
-        ]
+            for (node_idx, neuron_idx, val, side) in self._branching_constraints
+            if node_idx <= to_opt_bound.index]
         nb_constraints = len(active_branching_constraints)
         dual_vars = [jnp.zeros([nb_targets])] * nb_constraints
 
         # Define the objective function to optimize. The branching constraints
         # are lifted into the objective function.
         def unbranched_objective(dual_vars: ParamSet) -> Tuple[float, Tensor]:
-          objectives = chunk_objectives.copy()
+          objectives = dict(chunk_objectives)
           base_term = jnp.zeros([nb_targets])
           for ((node_idx, neuron_idx, val, side),
                branch_dvar) in zip(active_branching_constraints, dual_vars):
@@ -167,9 +166,9 @@ class OptimizingConcretizer(nonconvex.Concretizer):
           network_term = solve_problem(objectives)
           bound = network_term + base_term
 
-          return bound.sum(), bound
+          return bound.sum(), bound  # pytype: disable=bad-return-type  # jax-ndarray
 
-        def evaluate_bound(ini_dual_vars: List[Tensor]) -> Tensor:
+        def evaluate_bound(ini_dual_vars: Sequence[Tensor]) -> Tensor:
           ini_state = self._branching_optimizer.init(ini_dual_vars)
           eval_and_grad_fun = jax.grad(unbranched_objective, argnums=0,
                                        has_aux=True)
@@ -186,9 +185,9 @@ class OptimizingConcretizer(nonconvex.Concretizer):
           # This way, we are guaranteed that we keep track of the dual variables
           # producing the best bound at the end.
           def opt_step(
-              carry: Tuple[List[Tensor], List[Tensor],
+              carry: Tuple[Sequence[Tensor], Sequence[Tensor],
                            Tensor, optax.OptState], _
-          ) -> Tuple[Tuple[List[Tensor], List[Tensor],
+          ) -> Tuple[Tuple[Sequence[Tensor], Sequence[Tensor],
                            Tensor, optax.OptState], None]:
             best_lagdual, lagdual, best_bound, state = carry
             # Compute the bound and their gradients.
@@ -237,7 +236,7 @@ class OptimizingConcretizer(nonconvex.Concretizer):
 def _create_opt_problems(
     non_convex_bound: nonconvex.NonConvexBound,
     obj: Tensor,
-) -> Tuple[Dict[Index, Tuple[int, ...]], ParamSet]:
+) -> Tuple[Mapping[Index, Tuple[int, ...]], ParamSet]:
   """Define the objective function and the necessary variables shape.
 
   Iteratively yields the objectives to minimize in order to limit memory usage.

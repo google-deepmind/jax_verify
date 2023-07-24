@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Implementation of Forward propagation of linear bounds.
-"""
+"""Implementation of Forward propagation of linear bounds."""
+import abc
 import functools
-from typing import Dict, Iterator, Union, Sequence, Tuple
+from typing import Iterator, MutableMapping, Sequence, Tuple, Union
 
 import jax
 from jax import lax
@@ -29,31 +29,23 @@ from jax_verify.src import intersection
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
 from jax_verify.src.linear import linear_relaxations
+from jax_verify.src.types import Index, Primitive, Tensor  # pylint: disable=g-multiple-import
 import numpy as np
-
-Bound = bound_propagation.Bound
-Index = graph_traversal.Index
-Tensor = jnp.ndarray
-InputBound = graph_traversal.InputBound
-Primitive = graph_traversal.Primitive
-TransformContext = graph_traversal.TransformContext
-LinFun = linear_relaxations.LinFun
-LinearExpression = linear_relaxations.LinearExpression
 
 
 class RefBound:
   """Wrapper around a bound so that we can use it as a key."""
 
-  def __init__(self, index: Index, bound: Bound):
-    self._index = index
+  def __init__(self, index: Index, bound: graph_traversal.InputBound):
+    self.index = index
     self.bound = bound
-    self.nb_coeffs = np.prod(bound.lower.shape)
+    self.nb_coeffs = np.prod(bound.shape)
 
   def __hash__(self):
-    return hash(self._index)
+    return hash(self.index)
 
   def __eq__(self, other):
-    return self._index == other._index
+    return self.index == other.index
 
 
 class LinearFunction:
@@ -62,12 +54,20 @@ class LinearFunction:
   We store the linear functions as LinearExpressions objects in `lower_lin` and
   `upper_lin`, and also maintain a reference to the initial bounds on the input
   to be able to concretize the bounds when needed.
+
+  The LinearExpression that we use to represent the bounds are represented by
+  two tensors:
+    - lin_coeffs of shape [nb_elements_ref_bounds, *act_dim]
+    - offset of shape [*act_dim]
+  where nb_elements_ref_bounds is the number of entries in the reference bound
+  (essentially the size if it was flattened) and act_dim are the dimension of
+  the bounds that we are representing.
   """
 
   def __init__(self,
-               lower_linexp: LinearExpression,
-               upper_linexp: LinearExpression,
-               reference_bound: RefBound):
+               lower_linexp: linear_relaxations.LinearExpression,
+               upper_linexp: linear_relaxations.LinearExpression,
+               reference_bound: RefBound,):
     self.lower_lin = lower_linexp
     self.upper_lin = upper_linexp
     self.reference_bound = reference_bound
@@ -77,26 +77,24 @@ class LinearFunction:
     return self.lower_lin.shape
 
   @property
+  def dtype(self):
+    return self.lower_lin.dtype
+
+  @property
   def nb_coeffs(self):
     return self.reference_bound.nb_coeffs
 
   def concretize(self) -> Tuple[Tensor, Tensor]:
     """Concretize the linear functions to obtain scalar bounds."""
-    nb_act = len(self.shape)
-    broad_shape = (-1,) + (1,)*nb_act
-    flat_ref_lb = jnp.reshape(self.reference_bound.bound.lower, broad_shape)
-    flat_ref_ub = jnp.reshape(self.reference_bound.bound.upper, broad_shape)
+    ref_bound = self.reference_bound.bound
+    inp_shape = ref_bound.shape
+    concrete_lb = jnp.reshape(
+        linear_relaxations.concretize_linear_expression(
+            self.lower_lin.transpose(inp_shape), ref_bound), self.shape)
 
-    concrete_lb = (
-        (jnp.maximum(self.lower_lin.lin_coeffs, 0.) * flat_ref_lb).sum(axis=0) +
-        (jnp.minimum(self.lower_lin.lin_coeffs, 0.) * flat_ref_ub).sum(axis=0) +
-        self.lower_lin.offset
-    )
-    concrete_ub = (
-        (jnp.maximum(self.upper_lin.lin_coeffs, 0.) * flat_ref_ub).sum(axis=0) +
-        (jnp.minimum(self.upper_lin.lin_coeffs, 0.) * flat_ref_lb).sum(axis=0) +
-        self.upper_lin.offset
-    )
+    concrete_ub = -jnp.reshape(
+        linear_relaxations.concretize_linear_expression(
+            -self.upper_lin.transpose(inp_shape), ref_bound), self.shape)
     return concrete_lb, concrete_ub
 
   def __add__(self, other: Union['LinearFunction', Tensor]) -> 'LinearFunction':
@@ -144,6 +142,11 @@ class LinearFunction:
                             self.reference_bound)
 
 
+def identity_lin_coeffs(bound: graph_traversal.InputBound) -> Tensor:
+  input_dim = np.prod(bound.shape)
+  return jnp.reshape(jnp.eye(input_dim), (input_dim, *bound.shape))
+
+
 class LinearBound(bound_propagation.Bound):
   """Linear bound over activations.
 
@@ -152,7 +155,7 @@ class LinearBound(bound_propagation.Bound):
   """
 
   def __init__(self, linear_functions: Sequence[LinearFunction]):
-    self._refbound_to_linfun: Dict[RefBound, LinearFunction] = {}
+    self._refbound_to_linfun: MutableMapping[RefBound, LinearFunction] = {}
     for function in linear_functions:
       ref_bound = function.reference_bound
       if ref_bound in self._refbound_to_linfun:
@@ -161,6 +164,7 @@ class LinearBound(bound_propagation.Bound):
         self._refbound_to_linfun[ref_bound] = function
     self._concretized = None
     self._shape = next(iter(linear_functions)).shape
+    self._dtype = next(iter(linear_functions)).dtype
 
   @property
   def lower(self):
@@ -178,6 +182,10 @@ class LinearBound(bound_propagation.Bound):
   def shape(self):
     return self._shape
 
+  @property
+  def dtype(self):
+    return self._dtype
+
   def concretize(self):
     if self._concretized is not None:
       return self._concretized
@@ -194,19 +202,18 @@ class LinearBound(bound_propagation.Bound):
     self._concretized = interval_bound
 
   @staticmethod
-  def initial_linear_bound(index, lower_bound, upper_bound):
-    input_dim = np.prod(lower_bound.shape)
-    lin_coeffs = jnp.reshape(jnp.eye(input_dim),
-                             (input_dim, *lower_bound.shape))
-    offsets = jnp.zeros_like(lower_bound)
-    identity_lin = LinearExpression(lin_coeffs, offsets)
+  def initial_linear_bound(index: Index,
+                           input_bound: graph_traversal.InputBound):
+    lin_coeffs = identity_lin_coeffs(input_bound)
+    offsets = jnp.zeros_like(input_bound.lower)
+    identity_lin = linear_relaxations.LinearExpression(lin_coeffs, offsets)
 
-    reference_bound = ibp.IntervalBound(lower_bound, upper_bound)
     lin_function = LinearFunction(identity_lin, identity_lin,
-                                  RefBound(index, reference_bound))
+                                  RefBound(index, input_bound))
 
     lin_bound = LinearBound([lin_function])
-    lin_bound.set_concretized(ibp.IntervalBound(lower_bound, upper_bound))
+    lin_bound.set_concretized(
+        ibp.IntervalBound(input_bound.lower, input_bound.upper))
 
     return lin_bound
 
@@ -220,7 +227,8 @@ class LinearBound(bound_propagation.Bound):
       lincoeffs_shape = (ref_bound.nb_coeffs, *self.shape)
       zero_lincoeffs = jnp.zeros(lincoeffs_shape)
       zero_offsets = jnp.zeros(self.shape)
-      zero_linexpr = LinearExpression(zero_lincoeffs, zero_offsets)
+      zero_linexpr = linear_relaxations.LinearExpression(
+          zero_lincoeffs, zero_offsets)
       return LinearFunction(zero_linexpr, zero_linexpr, ref_bound)
 
   def linear_functions(self) -> Iterator[LinearFunction]:
@@ -232,12 +240,16 @@ class LinearBound(bound_propagation.Bound):
       yield ref_bound
 
 
-def _get_linop_parts(
-    lin_op: LinFun,
+def get_linop_parts(
+    lin_op: linear_relaxations.LinFun,
     invals: Sequence[LinearBound],
     lin_is_positive: bool = False,
     lin_is_negative: bool = False,
-) -> Tuple[Tuple[LinFun, LinFun], Tuple[LinFun, LinFun], Tensor]:
+) -> Tuple[
+    Tuple[linear_relaxations.LinFun, linear_relaxations.LinFun],
+    Tuple[linear_relaxations.LinFun, linear_relaxations.LinFun],
+    Tensor,
+]:
   """Extract the functions that implement positive/negative parts of lin_op.
 
   For convenience, we will also return their vmapped version.
@@ -256,7 +268,7 @@ def _get_linop_parts(
     offset: Constant part of the lin_op
   """
 
-  zero_inps = [jnp.zeros(inval.shape) for inval in invals]
+  zero_inps = [jnp.zeros(inval.shape, inval.dtype) for inval in invals]
   offset = lin_op(*zero_inps)
 
   # In case we are told that the linear function has only positive, or only
@@ -299,8 +311,8 @@ def _get_linop_parts(
   return (pos_part_op, neg_part_op), (pos_part_vop, neg_part_vop), offset
 
 
-def _forward_propagate_linear_bounds(lb_lin_op: LinFun,
-                                     ub_lin_op: LinFun,
+def _forward_propagate_linear_bounds(lb_lin_op: linear_relaxations.LinFun,
+                                     ub_lin_op: linear_relaxations.LinFun,
                                      invals: Sequence[LinearBound],
                                      lin_is_positive: bool = False,
                                      lin_is_negative: bool = False
@@ -329,12 +341,12 @@ def _forward_propagate_linear_bounds(lb_lin_op: LinFun,
   """
   ((lb_pospart_op, lb_negpart_op),
    (lb_pospart_vop, lb_negpart_vop),
-   lb_offset) = _get_linop_parts(lb_lin_op, invals,
-                                 lin_is_positive, lin_is_negative)
+   lb_offset) = get_linop_parts(lb_lin_op, invals,
+                                lin_is_positive, lin_is_negative)
   ((ub_pospart_op, ub_negpart_op),
    (ub_pospart_vop, ub_negpart_vop),
-   ub_offset) = _get_linop_parts(ub_lin_op, invals,
-                                 lin_is_positive, lin_is_negative)
+   ub_offset) = get_linop_parts(ub_lin_op, invals,
+                                lin_is_positive, lin_is_negative)
   all_ref_bound = set()
   for arg in invals:
     for ref_bound in arg.reference_bounds():
@@ -357,7 +369,8 @@ def _forward_propagate_linear_bounds(lb_lin_op: LinFun,
                     + lb_negpart_op(*(linfun.upper_lin.offset
                                       for linfun in in_linfuns))
                     + lb_offset_shared)
-    lower_linexpr = LinearExpression(lower_lincoeffs, lower_offset)
+    lower_linexpr = linear_relaxations.LinearExpression(
+        lower_lincoeffs, lower_offset)
 
     upper_lincoeffs = (ub_pospart_vop(*(linfun.upper_lin.lin_coeffs
                                         for linfun in in_linfuns))
@@ -368,7 +381,8 @@ def _forward_propagate_linear_bounds(lb_lin_op: LinFun,
                     + ub_negpart_op(*(linfun.lower_lin.offset
                                       for linfun in in_linfuns))
                     + ub_offset_shared)
-    upper_linexpr = LinearExpression(upper_lincoeffs, upper_offset)
+    upper_linexpr = linear_relaxations.LinearExpression(
+        upper_lincoeffs, upper_offset)
 
     out_linfun = LinearFunction(lower_linexpr, upper_linexpr, ref_bound)
     out_linfuns.append(out_linfun)
@@ -408,7 +422,7 @@ def _fastlin_bilinearwithparam_op(primitive: Primitive,
     param_arg = lhs
     fun_call = lambda b_arg, p_arg: primitive.bind(p_arg, b_arg, **kwargs)
 
-  vmap_funcall = jax.vmap(fun_call, in_axes=(1, None), out_axes=1)
+  vmap_funcall = jax.vmap(fun_call, in_axes=(0, None), out_axes=0)
 
   # Extract the parameters for the bound propagation.
   abs_params = jnp.abs(param_arg)
@@ -429,10 +443,10 @@ def _fastlin_bilinearwithparam_op(primitive: Primitive,
     out_mean_lin_coeffs = vmap_funcall(mean_lin.lin_coeffs, param_arg)
     out_mean_offset = fun_call(mean_lin.offset, param_arg)
 
-    out_lowerlinexp = LinearExpression(
+    out_lowerlinexp = linear_relaxations.LinearExpression(
         out_mean_lin_coeffs - out_range_lin_coeffs,
         out_mean_offset - out_range_offset)
-    out_upperlinexp = LinearExpression(
+    out_upperlinexp = linear_relaxations.LinearExpression(
         out_mean_lin_coeffs + out_range_lin_coeffs,
         out_mean_offset + out_range_offset)
 
@@ -500,7 +514,7 @@ def forward_crown_bound_propagation(function, *bounds):
   Returns:
     output_bound: Bounds on the output of the function obtained by FastLin
   """
-  forward_crown_transform = ForwardLinearBoundTransform(
+  forward_crown_transform = ConcretizingForwardLinearBoundTransform(
       linear_relaxations.crown_rvt_relaxer)
   output_bound, _ = bound_propagation.bound_propagation(
       bound_propagation.ForwardPropagationAlgorithm(forward_crown_transform),
@@ -527,12 +541,11 @@ def ibpforwardfastlin_bound_propagation(function, *bounds):
 
 
 class ForwardLinearBoundTransform(
-    graph_traversal.GraphTransform[LinearBound]):
+    graph_traversal.GraphTransform[LinearBound],
+    metaclass=abc.ABCMeta):
   """Propagate Linear bounds forward through the network."""
 
-  def __init__(self, relaxer: linear_relaxations.LinearBoundsRelaxer,
-               linear_elision: bool = False):
-    self.relaxer = relaxer
+  def __init__(self, linear_elision: bool = False):
     self._linear_elision = linear_elision
 
   def should_handle_as_subgraph(self, primitive: Primitive) -> bool:
@@ -543,15 +556,22 @@ class ForwardLinearBoundTransform(
     else:
       return super().should_handle_as_subgraph(primitive)
 
-  def input_transform(self, context: TransformContext,
-                      input_bound: InputBound) -> LinearBound:
-    return LinearBound.initial_linear_bound(
-        context.index, input_bound.lower, input_bound.upper)
+  def input_transform(
+      self,
+      context: graph_traversal.TransformContext[
+          linear_relaxations.LinearExpression],
+      input_bound: graph_traversal.InputBound,
+  ) -> LinearBound:
+    return LinearBound.initial_linear_bound(context.index, input_bound)
 
-  def primitive_transform(self, context: TransformContext,
-                          primitive: Primitive,
-                          *args: Union[Bound, Tensor],
-                          **params) -> LinearBound:
+  def primitive_transform(
+      self,
+      context: graph_traversal.TransformContext[
+          linear_relaxations.LinearExpression],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[LinearBound],
+      **params,
+  ) -> LinearBound:
     # We specialise bilinear and reshape operation because we can compute them
     # in a more lightweight manner, without having to resort to identifying
     # parameters.
@@ -564,34 +584,68 @@ class ForwardLinearBoundTransform(
       safe_params = synthetic_primitives.filter_jaxverify_kwargs(params)
       lin_fun = utils.bind_nonbound_args(primitive.bind, *args, **safe_params)
       lin_bound_inputs = [arg.unwrap() for arg in args
-                          if isinstance(arg, Bound)]
+                          if isinstance(arg, bound_propagation.Bound)]
       return _forward_propagate_linear_bounds(lin_fun, lin_fun,
                                               lin_bound_inputs,
                                               lin_is_positive=is_positive)
     else:
       # This is not an affine primitive. We need to go through a relaxation.
-      # Obtain the linear bounds.
-      lb_linfun, ub_linfun = self.relaxer.linearize_primitive(
-          context.index, primitive, *args, **params)
-      # Translate to functions that only accept variable (linear bound) inputs.
-      lb_linfun = utils.bind_nonbound_args(lb_linfun, *args)
-      ub_linfun = utils.bind_nonbound_args(ub_linfun, *args)
-      lin_bound_inputs = [arg.unwrap() for arg in args
-                          if isinstance(arg, Bound)]
+      return self.nonlinear_primitive_transform(context, primitive,
+                                                *args, **params)
 
-      is_positive = primitive in POSITIVE_RELAXATION_PRIMITIVES
-      is_negative = primitive in NEGATIVE_RELAXATION_PRIMITIVES
+  @abc.abstractmethod
+  def nonlinear_primitive_transform(
+      self,
+      context: graph_traversal.TransformContext[
+          linear_relaxations.LinearExpression],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[LinearBound],
+      **params,
+  ) -> LinearBound:
+    pass
 
-      return _forward_propagate_linear_bounds(
-          lb_linfun, ub_linfun, lin_bound_inputs,
-          lin_is_positive=is_positive, lin_is_negative=is_negative)
+
+class ConcretizingForwardLinearBoundTransform(ForwardLinearBoundTransform):
+  """Forward linear bound propagation with concretization at every node."""
+
+  def __init__(self,
+               relaxer: linear_relaxations.LinearBoundsRelaxer,
+               linear_elision: bool = False):
+    super().__init__(linear_elision)
+    self.relaxer = relaxer
+
+  def nonlinear_primitive_transform(
+      self,
+      context: graph_traversal.TransformContext[
+          linear_relaxations.LinearExpression],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[LinearBound],
+      **params,
+    ) -> LinearBound:
+    # This is not an affine primitive. We need to go through a relaxation.
+    # Obtain the linear bounds.
+    lb_linfun, ub_linfun = self.relaxer.linearize_primitive(
+        context.index, primitive, *args, **params)
+    # Translate to functions that only accept variable (linear bound) inputs.
+    lb_linfun = utils.bind_nonbound_args(lb_linfun, *args)
+    ub_linfun = utils.bind_nonbound_args(ub_linfun, *args)
+    lin_bound_inputs = [arg.unwrap() for arg in args
+                        if isinstance(arg, bound_propagation.Bound)]
+
+    is_positive = primitive in POSITIVE_RELAXATION_PRIMITIVES
+    is_negative = primitive in NEGATIVE_RELAXATION_PRIMITIVES
+
+    return _forward_propagate_linear_bounds(
+        lb_linfun, ub_linfun, lin_bound_inputs,
+        lin_is_positive=is_positive, lin_is_negative=is_negative)
 
 
 POSLINEAR_PRIMITIVES = [
     lax.scatter_add_p,
     lax.add_p,
     lax.reduce_sum_p,
-] + bound_propagation.RESHAPE_PRIMITIVES
+    *bound_propagation.RESHAPE_PRIMITIVES,
+]
 
 POSITIVE_RELAXATION_PRIMITIVES = [
     synthetic_primitives.relu_p,
@@ -602,5 +656,5 @@ NEGATIVE_RELAXATION_PRIMITIVES = [
     synthetic_primitives.posreciprocal_p,
 ]
 
-forward_fastlin_transform = ForwardLinearBoundTransform(
+forward_fastlin_transform = ConcretizingForwardLinearBoundTransform(
     linear_relaxations.fastlin_rvt_relaxer)

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 from jax import numpy as jnp
+import jax_verify
 from jax_verify.src import synthetic_primitives
 
 
@@ -47,12 +48,15 @@ class SyntheticPrimitiveDetectorTest(parameterized.TestCase):
     simplified_graph = synthetic_primitives.simplify_graph(simplifier, graph,
                                                            var_is_bound)
     for eqn in simplified_graph.eqns:
-      sub_graph = synthetic_primitives.jax_primitive_subgraph(eqn)
-
-      if sub_graph is not None:
-        subgraph_var_is_bound = {
-            sub_invar: var_is_bound[eqn_invar] for sub_invar, eqn_invar
-            in zip(sub_graph.invars, eqn.invars)}
+      if eqn.primitive in synthetic_primitives.SUBGRAPH_PRIMITIVES:
+        sub_graph = synthetic_primitives.jax_primitive_subgraph(
+            eqn.primitive, **eqn.params)
+        subgraph_var_is_bound = {}
+        for sub_invar, eqn_invar in zip(sub_graph.invars, eqn.invars):
+          if isinstance(eqn_invar, jax.core.Literal):
+            subgraph_var_is_bound[sub_invar] = False
+          else:
+            subgraph_var_is_bound[sub_invar] = var_is_bound[eqn_invar]
         match = self._find_eqn_in_simplified_graph(
             sub_graph, simplifier, subgraph_var_is_bound, primitive)
         if match:
@@ -281,6 +285,79 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
         var_is_bound, inp)
 
   @parameterized.named_parameters(('jit', True), ('nojit', False))
+  def test_clip_detected(self, use_jit):
+
+    def clip_model(x):
+      return jnp.clip(x, a_min=0., a_max=1.)
+
+    if use_jit:
+      clip_model = jax.jit(clip_model)
+
+    inp = jnp.array([[-2., 3., 0.5]])
+    parsed = synthetic_primitives.make_jaxpr_nojit(clip_model, inp)
+    var_is_bound = {parsed.jaxpr.invars[0]: True}
+
+    match = self._find_eqn_in_simplified_graph(
+        parsed.jaxpr,
+        synthetic_primitives.activation_simplifier,
+        var_is_bound,
+        synthetic_primitives.clip_p)
+
+    self.assertIsNotNone(match)
+
+    self._check_correct_impl(
+        parsed.jaxpr, synthetic_primitives.activation_simplifier,
+        var_is_bound, inp)
+
+  @parameterized.product(
+      tested_fun=[jnp.minimum, jnp.maximum],
+      use_jit=[True, False],
+      include_linear=[True, False],
+      both_inp_bounds=[True, False],
+      broadcasting=[True, False])
+  def test_elementwise_minmax_replaced(
+      self,
+      tested_fun,
+      use_jit,
+      include_linear,
+      both_inp_bounds,
+      broadcasting,
+  ):
+    def model_fun(inp_0, inp_1):
+      if include_linear:
+        lin_weight = jax.random.uniform(jax.random.PRNGKey(0),
+                                        inp_0.shape)
+        act = inp_0 * lin_weight
+      else:
+        act = inp_0
+      return tested_fun(act, inp_1)
+
+    if use_jit:
+      model_fun = jax.jit(model_fun)
+
+    if broadcasting:
+      shape_0 = (1, 8)
+      shape_1 = (7, 1)
+    else:
+      shape_0 = (2, 4)
+      shape_1 = (2, 4)
+    inp_0 = jax.random.uniform(jax.random.PRNGKey(0), shape_0)
+    inp_1 = jax.random.uniform(jax.random.PRNGKey(0), shape_1)
+
+    parsed = synthetic_primitives.make_jaxpr_nojit(model_fun, inp_0, inp_1)
+    var_is_bound = {parsed.jaxpr.invars[0]: True,
+                    parsed.jaxpr.invars[1]: both_inp_bounds}
+    # Check that this is rewritten using a ReLU.
+    relu_match = self._find_eqn_in_simplified_graph(
+        parsed.jaxpr,
+        synthetic_primitives.default_simplifier,
+        var_is_bound, synthetic_primitives.relu_p)
+    self.assertIsNotNone(relu_match)
+    self._check_correct_impl(
+        parsed.jaxpr, synthetic_primitives.default_simplifier, var_is_bound,
+        inp_0, inp_1)
+
+  @parameterized.named_parameters(('jit', True), ('nojit', False))
   def test_linear_detected(self, use_jit):
 
     inp = jnp.array([[-1., 1.]])
@@ -361,6 +438,37 @@ class ActivationDetectorTest(SyntheticPrimitiveDetectorTest):
     self._check_correct_impl(
         parsed.jaxpr, synthetic_primitives.fused_relu_simplifier,
         var_is_bound, inp, w, b)
+
+  @parameterized.named_parameters(('jit', True), ('nojit', False))
+  def test_support_weaktype_input(self, use_jit):
+
+    inp = jnp.asarray(0.)
+
+    def net_model(inp):
+      return jnp.zeros(()) * inp
+
+    if use_jit:
+      net_model = jax.jit(net_model)
+
+    parsed = synthetic_primitives.make_jaxpr_nojit(net_model, inp)
+    var_is_bound = {parsed.jaxpr.invars[0]: True}
+    match = self._find_eqn_in_simplified_graph(
+        parsed.jaxpr,
+        synthetic_primitives.activation_simplifier,
+        var_is_bound,
+        synthetic_primitives.convert_float32_p)
+
+    self.assertIsNotNone(match)
+
+    # Let's check that the simplification has not modified the behaviour of the
+    # model and can be forwarded through.
+    self._check_correct_impl(
+        parsed.jaxpr, synthetic_primitives.fused_relu_simplifier,
+        var_is_bound, inp)
+
+    # Let's check that propagating bounds through this does not cause errors.
+    jax_verify.interval_bound_propagation(
+        net_model, jax_verify.IntervalBound(inp, inp))
 
 if __name__ == '__main__':
   absltest.main()

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 r"""Run SDP verification for adversarial robustness specification.
 
 Example launch commands which achieve good results:
@@ -232,7 +231,7 @@ def run_verification(writer):
       'ibp_bound': ibp_bound,
   }
   output_dict.update(info)
-  jax_to_np = lambda x: np.array(x) if isinstance(x, jnp.DeviceArray) else x
+  jax_to_np = lambda x: np.array(x) if isinstance(x, jax.Array) else x
   output_dict = jax.tree_map(jax_to_np, output_dict)
   writer.write(output_dict)
 

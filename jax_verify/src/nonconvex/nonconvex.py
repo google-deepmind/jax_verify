@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ nonconvex_optimizable_bounds.py
 
 import abc
 import functools
-from typing import Callable, Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Callable, Generic, Mapping, MutableMapping, Optional, Sequence, Tuple, Type, TypeVar, Union
 from absl import logging
 
 import jax
@@ -40,21 +40,12 @@ from jax_verify.src import graph_traversal
 from jax_verify.src import intersection
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
+from jax_verify.src.types import Index, Nest, Primitive, Tensor, TensorFun  # pylint: disable=g-multiple-import
 
 NnCvx = TypeVar('NnCvx', bound='NonConvexBound')
-Tensor = jnp.ndarray
-Index = bound_propagation.Index
-TransformContext = bound_propagation.TransformContext
-InputBound = graph_traversal.InputBound
-Bound = bound_propagation.Bound
-BoundTransform = bound_propagation.BoundTransform
-Primitive = bound_propagation.Primitive
 # Mapping of a position in the computation to a set of parameters.
 # These can be variables, gradients, or coefficients.
-ParamSet = Dict[Index, Tensor]
-PrimitiveInput = Union[Tensor, 'NonConvexBound']
-Nest = bound_propagation.Nest
-TensorFunction = Callable[..., Tensor]
+ParamSet = MutableMapping[Index, Tensor]
 
 
 def _sum_fn(fn, *args, **kwargs):
@@ -106,14 +97,14 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
   mechanisms required for the computation of the dual they implement.
   """
 
-  def __init__(self,
-               index: Index,
-               shape: Tuple[int, ...],
-               previous_bounds: Dict[Index, 'NonConvexBound'],
-               eval_fn: Callable[[ParamSet, ParamSet, ParamSet], Tensor],
-               variables: Dict[Index, Tuple[int, ...]],
-               concretized_bounds: Optional[bound_propagation.Bound] = None
-               ):
+  def __init__(
+      self,
+      index: Index,
+      shape: Tuple[int, ...],
+      previous_bounds: MutableMapping[Index, 'NonConvexBound'],
+      eval_fn: Callable[[ParamSet, ParamSet, ParamSet], Tensor],
+      variables: Mapping[Index, Tuple[int, ...]],
+      concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Shared computation for the creation of NonConvexBound.
 
     Args:
@@ -177,11 +168,15 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
     return self._shape
 
   @property
+  def dtype(self):
+    return jnp.float32
+
+  @property
   def lower(self) -> Tensor:
     if self._concretized_bounds is None:
       logging.warning('.lower called on a non-concretized bound.'
                       'Returning spurious bounds.')
-      return -float('inf') * jnp.ones(self.shape)
+      return -float('inf') * jnp.ones(self.shape, self.dtype)
     return self._concretized_bounds.lower
 
   @property
@@ -189,7 +184,7 @@ class NonConvexBound(bound_propagation.Bound, metaclass=abc.ABCMeta):
     if self._concretized_bounds is None:
       logging.warning('.upper called on a non-concretized bound.'
                       'Returning spurious bounds.')
-      return float('inf') * jnp.ones(self.shape)
+      return float('inf') * jnp.ones(self.shape, self.dtype)
     return self._concretized_bounds.upper
 
   def evaluate(self,
@@ -364,13 +359,14 @@ class ConstrainedNonConvexBound(NonConvexBound, metaclass=abc.ABCMeta):
     evaluation projected into the admissible bounds.
   """
 
-  def __init__(self,
-               index: Index,
-               shape: Tuple[int, ...],
-               previous_bounds: Dict[Index, 'ConstrainedNonConvexBound'],
-               eval_fn: Callable[[ParamSet, ParamSet, ParamSet], Tensor],
-               variables: Dict[Index, Tuple[int, ...]],
-               concretized_bounds: Optional[bound_propagation.Bound] = None):
+  def __init__(
+      self,
+      index: Index,
+      shape: Tuple[int, ...],
+      previous_bounds: MutableMapping[Index, 'ConstrainedNonConvexBound'],
+      eval_fn: Callable[[ParamSet, ParamSet, ParamSet], Tensor],
+      variables: Mapping[Index, Tuple[int, ...]],
+      concretized_bounds: Optional[bound_propagation.Bound] = None):
     super().__init__(index, shape, previous_bounds,
                      eval_fn, variables, concretized_bounds)
     self._imposed_bounds = None
@@ -442,9 +438,9 @@ class Concretizer(abc.ABC):
   @abc.abstractmethod
   def concrete_bound(
       self,
-      graph: bound_propagation.PropagationGraph,
-      env: Dict[jax.core.Var, Union[Bound, Tensor]],
-      nonconvex_bound: NonConvexBound) -> Bound:
+      graph: graph_traversal.PropagationGraph,
+      env: Mapping[jax.core.Var, bound_propagation.LayerInput],
+      nonconvex_bound: NonConvexBound) -> bound_propagation.Bound:
     """Returns a concretized bound."""
 
 
@@ -457,26 +453,29 @@ class BaseBoundConcretizer(Concretizer):
 
   def concrete_bound(
       self,
-      graph: bound_propagation.PropagationGraph,
-      env: Dict[jax.core.Var, Union[Bound, Tensor]],
-      nonconvex_bound: NonConvexBound) -> Bound:
+      graph: graph_traversal.PropagationGraph,
+      env: Mapping[jax.core.Var, bound_propagation.LayerInput],
+      nonconvex_bound: NonConvexBound) -> bound_propagation.Bound:
     return env[graph.jaxpr_node(nonconvex_bound.index)]
 
 
-def eval_if_nonconvexbound(inp: Union[NonConvexBound, Tensor],
-                           var_set: ParamSet,
-                           dummy_inps: Optional[ParamSet],
-                           activations: Optional[ParamSet]) -> Tensor:
+def eval_if_nonconvexbound(
+    inp: graph_traversal.LayerInput[NonConvexBound],
+    var_set: ParamSet,
+    dummy_inps: Optional[ParamSet],
+    activations: Optional[ParamSet]) -> Tensor:
   if isinstance(inp, NonConvexBound):
     return inp.evaluate(var_set, dummy_inps, activations)
   else:
     return inp
 
 
-def _nonconvex_linear_op(primitive: bound_propagation.Primitive,
-                         bound_cls: Type[NnCvx],
-                         index: Index,
-                         *in_vals: PrimitiveInput, **kwargs) -> NnCvx:
+def _nonconvex_linear_op(
+    primitive: Primitive,
+    bound_cls: Type[NnCvx],
+    index: Index,
+    *in_vals: graph_traversal.LayerInput[NonConvexBound],
+    **kwargs) -> NnCvx:
   """Propagation of NonConvex bounds through a linear operation.
 
   Args:
@@ -540,10 +539,12 @@ def _nonconvex_linear_op(primitive: bound_propagation.Primitive,
                         eval_fn, variables)
 
 
-def _nonconvex_div(bound_cls: Type[NnCvx],
-                   index: Index,
-                   lhs: PrimitiveInput,
-                   rhs: PrimitiveInput) -> NnCvx:
+def _nonconvex_div(
+    bound_cls: Type[NnCvx],
+    index: Index,
+    lhs: graph_traversal.LayerInput[NonConvexBound],
+    rhs: graph_traversal.LayerInput[NonConvexBound],
+) -> NnCvx:
   """Propagation of NonConvex bounds bounds through Elementwise division.
 
   We don't support the propagation of bounds through the denominator.
@@ -564,7 +565,7 @@ def _nonconvex_div(bound_cls: Type[NnCvx],
 def _activation_convex_relaxation(
     bound_cls: Type[NnCvx],
     index: Index,
-    inputs: List[NnCvx],
+    inputs: Sequence[NnCvx],
     act_type: Primitive,
     lb_fun: Callable[..., Tensor],
     ub_fun: Callable[..., Tensor],
@@ -616,7 +617,7 @@ def _activation_convex_relaxation(
 
 def _nonconvex_activation(
     act_type: Primitive,
-    relaxation: Callable[..., Tuple[TensorFunction, TensorFunction]],
+    relaxation: Callable[..., Tuple[TensorFun, TensorFun]],
     bound_cls: Type[NnCvx],
     index: Index,
     *inps: Union[NnCvx, Tensor],
@@ -644,8 +645,8 @@ def _nonconvex_activation(
     # can readily pre-compute interval bounds on its output.
     # `lb_fun` will be the original function whenever this is reached.
     precomputed_bound = bound_propagation.IntervalBound(
-        lb_fun(*[inp.lower for inp in inps]),
-        lb_fun(*[inp.upper for inp in inps]))
+        lb_fun(*[inp.lower for inp in inps]),  # pytype: disable=attribute-error  # jax-ndarray
+        lb_fun(*[inp.upper for inp in inps]))  # pytype: disable=attribute-error  # jax-ndarray
   else:
     precomputed_bound = None
 
@@ -659,7 +660,7 @@ def _nonconvex_activation(
 
 
 def _make_activation_primitive_transform(
-    primitive: synthetic_primitives.PrimitiveLike,
+    primitive: Primitive,
     activation: activation_relaxation.ActivationRelaxation,
 ) -> Callable[..., NonConvexBound]:
   return functools.partial(
@@ -668,30 +669,31 @@ def _make_activation_primitive_transform(
       eltwise_increasing=activation.eltwise_increasing)
 
 
-_linear_op_primitives = (
-    bound_propagation.AFFINE_PRIMITIVES +
-    bound_propagation.RESHAPE_PRIMITIVES
-)
-_nonconvex_primitive_transform = {
-    primitive: functools.partial(_nonconvex_linear_op, primitive)
-    for primitive in _linear_op_primitives}
-_nonconvex_primitive_transform.update({
+_linear_op_primitives: Sequence[Primitive] = [
+    *bound_propagation.AFFINE_PRIMITIVES,
+    *bound_propagation.RESHAPE_PRIMITIVES,
+]
+_nonconvex_primitive_transform: Mapping[
+    Primitive, Callable[..., NonConvexBound],
+] = {
+    **{primitive: functools.partial(_nonconvex_linear_op, primitive)
+       for primitive in _linear_op_primitives},
     lax.div_p: _nonconvex_div,
     **{primitive: _make_activation_primitive_transform(primitive, act)
-       for primitive, act in activation_relaxation.relaxation_fns.items()}
-})
+       for primitive, act in activation_relaxation.relaxation_fns.items()},
+}
 
 
 class _NonConvexTransform(
-    Generic[NnCvx], bound_propagation.GraphTransform[NnCvx]):
+    Generic[NnCvx], graph_traversal.GraphTransform[NnCvx]):
   """Graph Transform to build a NonConvex Relaxation, which can be optimized."""
 
   def __init__(
       self,
       bound_cls: Type[NnCvx],
       concretizer: Concretizer,
-      graph: bound_propagation.PropagationGraph,
-      env: Dict[jax.core.Var, Union[Bound, Tensor]],
+      graph: graph_traversal.PropagationGraph,
+      env: Mapping[jax.core.Var, bound_propagation.LayerInput],
   ):
     self._bound_cls = bound_cls
     self._concretizer = concretizer
@@ -700,17 +702,17 @@ class _NonConvexTransform(
 
   def input_transform(
       self,
-      context: TransformContext,
-      input_bound: InputBound,
+      context: graph_traversal.TransformContext[NnCvx],
+      input_bound: graph_traversal.InputBound,
   ) -> NnCvx:
     return self._bound_cls.initial_nonconvex_bound(
         context.index, input_bound.lower, input_bound.upper)
 
   def primitive_transform(
       self,
-      context: TransformContext,
-      primitive: bound_propagation.Primitive,
-      *args: PrimitiveInput,
+      context: graph_traversal.TransformContext[NnCvx],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[NnCvx],
       **params,
   ) -> NnCvx:
     for arg in args:
@@ -730,18 +732,18 @@ class _ConstrainedNonConvexTransform(
   def __init__(
       self,
       bound_cls: Type[ConstrainedNonConvexBound],
-      imposed_boundprop: BoundTransform,
+      imposed_boundprop: bound_propagation.BoundTransform,
       concretizer: Concretizer,
-      graph: bound_propagation.PropagationGraph,
-      env: Dict[jax.core.Var, Union[Bound, Tensor]],
+      graph: graph_traversal.PropagationGraph,
+      env: Mapping[jax.core.Var, bound_propagation.LayerInput],
   ):
     super().__init__(bound_cls, concretizer, graph, env)
     self._imposed_boundprop = imposed_boundprop
 
   def input_transform(
       self,
-      context: TransformContext,
-      input_bound: InputBound,
+      context: graph_traversal.TransformContext[ConstrainedNonConvexBound],
+      input_bound: graph_traversal.InputBound,
   ) -> ConstrainedNonConvexBound:
     bound = super().input_transform(context, input_bound)
     bound.set_imposed_bounds(self._imposed_boundprop.input_transform(
@@ -750,17 +752,18 @@ class _ConstrainedNonConvexTransform(
 
   def primitive_transform(
       self,
-      context: TransformContext,
-      primitive: bound_propagation.Primitive,
-      *args: Union[ConstrainedNonConvexBound, Tensor],
+      context: graph_traversal.TransformContext[ConstrainedNonConvexBound],
+      primitive: Primitive,
+      *args: graph_traversal.LayerInput[ConstrainedNonConvexBound],
       **params,
   ) -> ConstrainedNonConvexBound:
     bound = super().primitive_transform(context, primitive, *args, **params)
     imposed_bound_args = [
-        arg.imposed_bounds() if isinstance(arg, Bound) else arg
+        arg.imposed_bounds()
+        if isinstance(arg, bound_propagation.Bound) else arg
         for arg in args]
     bound.set_imposed_bounds(self._imposed_boundprop.equation_transform(
-        context, primitive, *imposed_bound_args, **params))
+        context, primitive, *imposed_bound_args, **params)[0])
     return bound
 
 
@@ -770,9 +773,9 @@ class NonConvexAlgorithm(
 
   def __init__(
       self,
-      nonconvex_transform_ctor: Callable[..., BoundTransform],
+      nonconvex_transform_ctor: Callable[..., bound_propagation.BoundTransform],
       concretizer: Concretizer,
-      base_boundprop: Optional[BoundTransform] = None):
+      base_boundprop: Optional[bound_propagation.BoundTransform] = None):
     super().__init__()
     self._nonconvex_transform_ctor = nonconvex_transform_ctor
     self._concretizer = concretizer
@@ -780,9 +783,12 @@ class NonConvexAlgorithm(
 
   def propagate(
       self,
-      graph: bound_propagation.PropagationGraph,
+      graph: graph_traversal.PropagationGraph,
       bounds: Nest[graph_traversal.GraphInput],
-  ) -> Tuple[Nest[Bound], Dict[jax.core.Var, Union[Bound, Tensor]]]:
+  ) -> Tuple[
+      Nest[bound_propagation.Bound],
+      Mapping[jax.core.Var, bound_propagation.LayerInput],
+  ]:
     if self._base_boundprop is not None:
       # Propagate the 'base' bounds in advance, for subsequent use by
       # the concretiser.
@@ -811,8 +817,8 @@ def nonconvex_algorithm(
     bound_cls: Type[NnCvx],
     concretizer: Concretizer,
     *,
-    base_boundprop: Optional[BoundTransform] = None,
-    imposed_boundprop: Optional[BoundTransform] = None,
+    base_boundprop: Optional[bound_propagation.BoundTransform] = None,
+    imposed_boundprop: Optional[bound_propagation.BoundTransform] = None,
 ) -> bound_propagation.PropagationAlgorithm[NnCvx]:
   """Builds a bound propagation algorithm for the non-convex formulation.
 

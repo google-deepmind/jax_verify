@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,8 +27,8 @@ import optax
 
 
 IntervalBound = jax_verify.IntervalBound
-Tensor = jnp.DeviceArray
-PRNGKey = jnp.DeviceArray
+Tensor = jax.Array
+PRNGKey = jax.Array
 DataSpec = verify_utils.DataSpec
 LayerParams = verify_utils.LayerParams
 ModelParams = verify_utils.ModelParams
@@ -225,7 +225,7 @@ def adversarial_attack(
   else:
     raise ValueError('Unsupported spec.')
 
-  return _run_attack(
+  return _run_attack(  # pytype: disable=bad-return-type  # jax-devicearray
       max_objective_fn=max_objective_fn,
       projection_fn=projection_fn,
       x_init=data_spec.input,

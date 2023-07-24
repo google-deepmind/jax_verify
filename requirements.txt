@@ -1,8 +1,8 @@
 absl-py
 cvxpy
 dm-tree
-jax>=0.3.4
-jaxlib>=0.3.2
+jax>=0.4.6
+jaxlib>=0.4.6
 numpy
 optax
 dm-haiku

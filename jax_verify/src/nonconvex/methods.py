@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 """Pre-canned non-convex methods."""
 from typing import Callable
 
-import jax.numpy as jnp
 from jax_verify.src import bound_propagation
 from jax_verify.src import graph_traversal
 from jax_verify.src import ibp
@@ -24,12 +23,7 @@ from jax_verify.src import synthetic_primitives
 from jax_verify.src.nonconvex import duals
 from jax_verify.src.nonconvex import nonconvex
 from jax_verify.src.nonconvex import optimizers
-
-
-Tensor = jnp.ndarray
-Index = bound_propagation.Index
-TransformContext = bound_propagation.TransformContext
-Nest = bound_propagation.Nest
+from jax_verify.src.types import Nest, Tensor  # pylint: disable=g-multiple-import
 
 
 def nonconvex_ibp_bound_propagation(

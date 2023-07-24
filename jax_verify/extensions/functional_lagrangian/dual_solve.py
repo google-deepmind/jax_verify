@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ def solve_dual(
     config: ConfigDict,
     bounds: Sequence[sdp_utils.IntBound],
     spec_type: verify_utils.SpecType,
-    spec_fn: Callable[..., jnp.array],
+    spec_fn: Callable[..., jnp.ndarray],
     params: ModelParams,
     dual_state: ConfigDict,
     mode: str,
@@ -122,7 +122,7 @@ def solve_dual_train(
     spec_type: verify_utils.SpecType,
     dual_params_types: ParamsTypes,
     logger: Callable[[int, Mapping[str, Any]], None],
-    key: jnp.array,
+    key: jnp.ndarray,
     num_steps: int,
     affine_before_relu: bool,
     device_type=None,
@@ -224,7 +224,7 @@ def solve_dual_eval(
     spec_type: verify_utils.SpecType,
     dual_params_types: ParamsTypes,
     logger: Callable[[int, Mapping[str, Any]], None],
-    key: jnp.array,
+    key: jnp.ndarray,
     affine_before_relu: bool,
     step: int,
     merge_problems: Optional[Dict[int, int]] = None,

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ from jax_verify.extensions.sdp_verify import utils as sdp_utils
 from jax_verify.src import bound_propagation
 from jax_verify.src import graph_traversal
 from jax_verify.src import synthetic_primitives
+from jax_verify.src.types import Nest
 import numpy as np
 import optax
 
@@ -36,7 +37,6 @@ Params = verify_utils.Params
 ParamsTypes = verify_utils.ParamsTypes
 InnerVerifInstance = verify_utils.InnerVerifInstance
 LagrangianForm = lag_form.LagrangianForm
-Nest = bound_propagation.Nest
 
 
 class DualOp(bound_propagation.Bound):
@@ -46,9 +46,10 @@ class DualOp(bound_propagation.Bound):
       self,
       name,
       base_bound: bound_propagation.Bound,
-      affine_fn: Callable[[jnp.array], jnp.array],
-      inputs: Optional[Sequence[Union['DualOp', jnp.array]]] = None,
-      relu_preact_name: Optional[int] = None):
+      affine_fn: Callable[[jnp.ndarray], jnp.ndarray],
+      inputs: Optional[Sequence[Union['DualOp', jnp.ndarray]]] = None,
+      relu_preact_name: Optional[int] = None,
+  ):
     self.name = name
     self._base_bound = base_bound
     self._affine_fn = affine_fn
@@ -60,11 +61,11 @@ class DualOp(bound_propagation.Bound):
     return self._base_bound
 
   @property
-  def lower(self) -> jnp.array:
+  def lower(self) -> jnp.ndarray:
     return self._base_bound.lower
 
   @property
-  def upper(self) -> jnp.array:
+  def upper(self) -> jnp.ndarray:
     return self._base_bound.upper
 
   @property
@@ -89,20 +90,20 @@ class DualOp(bound_propagation.Bound):
     return self._relu_preact_name
 
   @property
-  def inputs(self) -> Sequence[Union['DualOp', jnp.array]]:
+  def inputs(self) -> Sequence[Union['DualOp', jnp.ndarray]]:
     if self._inputs is None:
       raise ValueError('Input node does not have inputs')
     return self._inputs
 
 
-_affine_primitives_list = (
-    bound_propagation.AFFINE_PRIMITIVES +
-    bound_propagation.RESHAPE_PRIMITIVES +
-    [lax.div_p]
-)
+_affine_primitives_list = [
+    *bound_propagation.AFFINE_PRIMITIVES,
+    *bound_propagation.RESHAPE_PRIMITIVES,
+    lax.div_p,
+]
 
 
-class _LagrangianTransform(bound_propagation.GraphTransform[DualOp]):
+class _LagrangianTransform(graph_traversal.GraphTransform[DualOp]):
   """Identifies graph nodes having Lagrangian dual contributions."""
 
   def __init__(self, boundprop_transform: bound_propagation.BoundTransform):
@@ -121,7 +122,7 @@ class _LagrangianTransform(bound_propagation.GraphTransform[DualOp]):
   def primitive_transform(self, context, primitive, *args, **params):
     interval_args = [arg.base_bound if isinstance(arg, DualOp) else arg
                      for arg in args]
-    out_bounds = self._boundprop_transform.equation_transform(
+    out_bounds, = self._boundprop_transform.equation_transform(
         context, primitive, *interval_args, **params)
 
     if primitive in _affine_primitives_list:
@@ -159,9 +160,9 @@ class InnerMaxStrategy(metaclass=abc.ABCMeta):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     """Solve maximization problem of opt_instance.
 
     Args:
@@ -247,8 +248,8 @@ class InnerMaxStrategy(metaclass=abc.ABCMeta):
       boundprop_transform: bound_propagation.BoundTransform,
       spec_type: verify_utils.SpecType,
       affine_before_relu: bool,
-      spec_fn: Callable[..., jnp.array],
-      key: jnp.array,
+      spec_fn: Callable[..., jnp.ndarray],
+      key: jnp.ndarray,
       lagrangian_form_per_layer: Iterable[LagrangianForm],
       *input_bounds: Nest[graph_traversal.GraphInput],
   ) -> Tuple[Dict[int, DualOp], Params, ParamsTypes]:
@@ -352,7 +353,7 @@ def build_dual_fun(
     affine_before_relu: bool,
     spec_type: verify_utils.SpecType,
     merge_problems: Optional[Dict[int, int]] = None,
-) -> Callable[[Params, jnp.array, int], jnp.array]:
+) -> Callable[[Params, jnp.ndarray, int], jnp.ndarray]:
   """Build the dual function that takes as input the inner/outer lagrangian parameters.
 
   Args:
@@ -376,8 +377,9 @@ def build_dual_fun(
     objective, and takes as input the inner and outer dual variables, and the
     PRNG key.
   """
-  def dual_loss_fun(dual_params: Params,
-                    key: jnp.array, step: int) -> jnp.array:
+  def dual_loss_fun(
+      dual_params: Params, key: jnp.ndarray, step: int
+  ) -> jnp.ndarray:
     lagrange_params = dual_params.outer
     inner_vars_list = dual_params.inner
 
@@ -404,7 +406,7 @@ def build_dual_fun(
       loss += loss_inner_problem
 
     stats['loss'] = loss
-    return loss, stats
+    return loss, stats  # pytype: disable=bad-return-type  # jnp-array
 
   return dual_loss_fun
 

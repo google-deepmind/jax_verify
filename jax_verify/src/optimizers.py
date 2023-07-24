@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,18 +20,22 @@ from typing import Callable, Optional, Sequence, Tuple
 
 import jax
 from jax import numpy as jnp
-from jax_verify.src import bound_propagation
-
+from jax_verify.src import utils
+from jax_verify.src.types import Nest, Tensor  # pylint: disable=g-multiple-import
 import optax
 
-Tensor = bound_propagation.Tensor
-ParamSet = bound_propagation.Nest[Tensor]
-ProgressStats = bound_propagation.Nest[Tensor]
+ParamSet = Nest[Tensor]
+ProgressStats = Nest[Tensor]
 TensorFun = Callable[[ParamSet], Tensor]
 ProjectFun = Callable[[ParamSet], ParamSet]
 
 
 class Optimizer(metaclass=abc.ABCMeta):
+  """Base class defining the interface of the optimizers for JaxVerify."""
+
+  def __init__(self, log_optimization: bool = False):
+    self._log_optimization = log_optimization
+    self._opt_vals = None
 
   @abc.abstractmethod
   def optimize_fn(self,
@@ -50,6 +54,13 @@ class Optimizer(metaclass=abc.ABCMeta):
       opt_fun: Function taking initial parameters and returning optimized ones.
     """
 
+  def get_last_opt_run(self) -> Tensor:
+    if not self._log_optimization:
+      raise ValueError('Optimizer not configured to collect objective values.')
+    if self._opt_vals is None:
+      raise ValueError('Optimizer not called.')
+    return self._opt_vals
+
 
 class OptaxOptimizer(Optimizer):
   """Optimizer relying on Optax GradientTransformation to minimize an objective.
@@ -63,26 +74,11 @@ class OptaxOptimizer(Optimizer):
       opt_gt: optax.GradientTransformation,
       *,
       num_steps: int,
+      log_optimization: bool = False,
   ):
+    super().__init__(log_optimization)
     self._opt_gt = opt_gt
     self._num_steps = num_steps
-
-  def init_progress(self) -> ProgressStats:
-    """Returns initial progress, e.g. zero step counter."""
-    return 0
-
-  def update_progress(
-      self, progress_stats: ProgressStats,
-      val: Tensor, best_val: Tensor) -> ProgressStats:
-    """Returns updated progress, e.g. incremented step counter."""
-    step = progress_stats
-    del val, best_val
-    return step + 1
-
-  def should_continue(self, progress_stats: ProgressStats) -> bool:
-    """Returns whether to proceed with the next iteration, or terminate."""
-    step = progress_stats
-    return step < self._num_steps
 
   def optimize_fn(
       self,
@@ -93,8 +89,8 @@ class OptaxOptimizer(Optimizer):
     val_and_grad_fn = jax.value_and_grad(obj_fun)
 
     def update_state(
-        state: Tuple[ParamSet, ParamSet, ParamSet, Tensor, ProgressStats],
-    ) -> Tuple[ParamSet, ParamSet, ParamSet, Tensor, ProgressStats]:
+        state: Tuple[ParamSet, ParamSet, ParamSet, Tensor],
+    ) -> Tuple[ParamSet, ParamSet, ParamSet, Tensor]:
       """Update the state of the optimization.
 
       The loop state consists of:
@@ -102,14 +98,15 @@ class OptaxOptimizer(Optimizer):
         - opt_state: State of the optax optimizer.
         - best_params: Value of the parameters that gave the lowest results.
         - best_val: Objective value achieved for the best params.
-        - progress_stats: E.g. iteration counter.
 
       Args:
         state: The loop state.
       Returns:
-        The updated status of the loop after one more step of optimization.
+        next_state: The updated status of the loop after one more step of
+          optimization.
+        val: The value of the optimzation at this point.
       """
-      params, opt_state, best_params, best_val, progress_stats = state
+      params, opt_state, best_params, best_val = state
       val, params_grad = val_and_grad_fn(params)
 
       # Compute the next step in the optimization process.
@@ -119,25 +116,42 @@ class OptaxOptimizer(Optimizer):
 
       # Update the best params seen.
       where_improved = functools.partial(jnp.where, val < best_val)
-      best_params = jax.tree_multimap(where_improved, params, best_params)
-      best_val = where_improved(val, best_val)
+      next_best_params = jax.tree_util.tree_map(where_improved,
+                                                params, best_params)
+      next_best_val = where_improved(val, best_val)
 
-      progress_stats = self.update_progress(progress_stats, val, best_val)
-      return next_params, next_opt_state, best_params, best_val, progress_stats
+      next_state = (next_params, next_opt_state,
+                    next_best_params, next_best_val)
+      return next_state, val
 
     def opt_fun(init_params):
       best_params = init_params
       if self._num_steps:
         # Perform the optimization if we do at least one step.
         init_opt_state = self._opt_gt.init(init_params)
-        progress_stats = self.init_progress()
-        _, _, best_params, _, _ = jax.lax.while_loop(
-            lambda state: self.should_continue(state[-1]),
+        _, _, best_params, _ = self.opt_loop(
             update_state,
-            (init_params, init_opt_state, best_params, jnp.inf, progress_stats))
+            (init_params, init_opt_state, best_params, jnp.inf))
       return best_params
 
     return opt_fun
+
+  def opt_loop(self, body_fun, init_vals):
+    """Calls `body_fun` num_steps times to perform the optimization."""
+    if self._log_optimization:
+      step_fun = lambda carry, _: body_fun(carry)
+      final_carry, opt_vals = jax.lax.scan(step_fun, init_vals, None,
+                                           length=self._num_steps)
+      self._opt_vals = opt_vals
+      return final_carry
+    else:
+      # We drop the first value passed to the step function, because it
+      # correspond to the iteration number.
+      # We drop the second returned value, which is the current
+      # value of the optimization that we do not need to log.
+      step_fun = lambda _, carry: body_fun(carry)[0]
+      return utils.fori_loop_no_backprop(0, self._num_steps,
+                                         step_fun, init_vals)
 
 
 def _sum_fn(fn, *args, **kwargs):
@@ -153,7 +167,7 @@ def _quad_approx(x: ParamSet, y: ParamSet, grad_y: ParamSet, step_size: Tensor
     diff = x_var - y_var
     return ((diff * grady_var).sum()
             + 0.5 / step_size * (diff**2).sum())
-  per_var_quad_approx = jax.tree_multimap(quad_approx_var, x, y, grad_y)
+  per_var_quad_approx = jax.tree_util.tree_map(quad_approx_var, x, y, grad_y)
   return sum(jax.tree_util.tree_leaves(per_var_quad_approx))
 
 
@@ -190,7 +204,9 @@ class LinesearchFistaOptimizer(Optimizer):
                min_step_size: float = 1e-5,
                beta_l: float = 0.5,
                beta_h: float = 1.5,
-               check_convergence_every: int = 1):
+               check_convergence_every: int = 1,
+               log_optimization: bool = False):
+    super().__init__(log_optimization)
     self._num_steps = num_steps
     self._max_step_size = max_step_size
     self._min_step_size = min_step_size
@@ -226,7 +242,7 @@ class LinesearchFistaOptimizer(Optimizer):
       def step_per_var(curr, g):
         brd_step_size = _broadcast_back_like(step_size, g)
         return curr - brd_step_size * g
-      gd_step = jax.tree_multimap(step_per_var, current, grad)
+      gd_step = jax.tree_util.tree_map(step_per_var, current, grad)
       return project_params(gd_step)
 
     def should_decrease(step_size: Tensor,
@@ -237,6 +253,7 @@ class LinesearchFistaOptimizer(Optimizer):
       val_qapprox = obj_y + _quad_approx(new_x, y, grad_y, step_size)
       per_sp_insufficient_progress = val_newx >= val_qapprox
       step_size_not_min = step_size > self._min_step_size
+      # Perform the updates
       return jnp.logical_and(step_size_not_min, per_sp_insufficient_progress)
 
     # This will be performed in jax.lax.while_loop, with the following arguments
@@ -276,11 +293,12 @@ class LinesearchFistaOptimizer(Optimizer):
     #   x, y: variable set
     #   gamma: float, coefficient used for the momentum (t_k in the paper)
     #   step_size: Array containing the current values of the step size.
+    #   last_obj_value: Last value of obj(j)
     # We stop either based on a maximum number of iterations, or based on the
     # given convergence criterion, which is checked every
     # self._check_convergence_every iterations.
     def fista_with_linesearch_step(opt_loop_args):
-      it, x, y, gamma, step_size = opt_loop_args
+      it, x, y, gamma, step_size, _ = opt_loop_args
       # Compute f_y and d(f_y)/d(y)
       # We ignore the first returned value which correspond to the sum of the
       # objectives rather than the individual objectives.
@@ -298,14 +316,14 @@ class LinesearchFistaOptimizer(Optimizer):
       new_x = pgd_step(y, grad_y, new_step_size)
       new_gamma = 1 + jnp.sqrt(1 + gamma ** 2) / 2
       coeff = (gamma - 1) / new_gamma
-      new_y = jax.tree_multimap(lambda new, old: new + coeff * (new - old),
-                                new_x, x)
+      new_y = jax.tree_util.tree_map(
+          lambda new, old: new + coeff * (new - old), new_x, x)
 
       # Increase the step size of the samples that didn't need reducing.
       new_step_size = jnp.where(ini_need_lower,
                                 new_step_size, self._beta_h * new_step_size)
 
-      return it + 1, new_x, new_y, new_gamma, new_step_size
+      return it + 1, new_x, new_y, new_gamma, new_step_size, obj_y
 
     def continue_criterion(opt_loop_args):
       it, x, *_ = opt_loop_args
@@ -322,15 +340,55 @@ class LinesearchFistaOptimizer(Optimizer):
       gamma = jnp.array(0.)
       nb_targets = jax.eval_shape(obj_fun, ini_x).shape
       step_size = self._max_step_size * jnp.ones(nb_targets)
+      init_val = jnp.inf * jnp.ones(nb_targets)
       it = jnp.array(0)
 
-      _, final_x, _, _, _ = jax.lax.while_loop(
+      _, final_x, _, _, _, _ = self.opt_loop(
           continue_criterion,
           fista_with_linesearch_step,
-          (it, ini_x, ini_y, gamma, step_size))
+          (it, ini_x, ini_y, gamma, step_size, init_val))
       return final_x
 
     return optimize
+
+  def opt_loop(self, continue_fun, update_fun, init_vals):
+    """Performs the optimzation.
+
+    The step is defined by the `update_fun` function, and the optimization is
+    run for a maximum of self._num_steps, unless `continue_fun` returns False
+    at any point.
+
+    Args:
+      continue_fun: Function indicating whether the optimization has converged.
+      update_fun: Function performing one step of optimization.
+      init_vals: Initial value of the optimizition variables.
+    Returns:
+      The final state of the optimzation variables.
+    """
+    if self._log_optimization:
+      # We want to log the data throughout so we need the number of steps to
+      # remain the same whatever happens, but we also don't want the
+      # optimization (including the early stopping) to change just because we're
+      # logging it. We're wrapping the function to add a marker of whether or
+      # not the optimization has finished. If it has, we just stop updating the
+      # values.
+      # We also extract the value of the objective, which is the last element of
+      # the carry, so that we can extract it from the scan loop.
+      def step_fun(wrapped_loop_args, _):
+        stopped, *opt_loop_args = wrapped_loop_args
+        should_continue = continue_fun(opt_loop_args)
+        new_stopped = jnp.logical_or(stopped, jnp.logical_not(should_continue))
+        new_opt_loop_args = jax.lax.cond(new_stopped, tuple, update_fun,
+                                         operand=opt_loop_args)
+        val = new_opt_loop_args[-1]
+        return (new_stopped, *new_opt_loop_args), val
+      ini_stopped = jnp.array(True)
+      (_, *final_carry), opt_vals = jax.lax.scan(
+          step_fun, (ini_stopped, *init_vals), None, length=self._num_steps)
+      self._opt_vals = opt_vals
+      return final_carry
+    else:
+      return jax.lax.while_loop(continue_fun, update_fun, init_vals)
 
 
 class PortfolioOptimizer(Optimizer):
@@ -339,8 +397,12 @@ class PortfolioOptimizer(Optimizer):
   Runs all of them independently and give the best result.
   """
 
-  def __init__(self, optimizers: Sequence[Optimizer]):
+  def __init__(self, optimizers: Sequence[Optimizer],
+               log_optimization: bool = False):
+    super().__init__(log_optimization)
     self._optimizers = optimizers
+    if log_optimization:
+      self._best_optimizer = 0
 
   def optimize_fn(self,
                   obj_fun: TensorFun,
@@ -355,13 +417,25 @@ class PortfolioOptimizer(Optimizer):
       best_params = initial_params
       best_score = jnp.inf
 
-      for base_opt_fun in base_opt_funs:
+      for opt_idx, base_opt_fun in enumerate(base_opt_funs):
         opt_params = base_opt_fun(initial_params)
         score = obj_fun(opt_params).sum()
         where_improved = functools.partial(jnp.where, score < best_score)
 
-        best_params = jax.tree_multimap(where_improved, opt_params, best_params)
+        best_params = jax.tree_util.tree_map(where_improved, opt_params,
+                                             best_params)
+        if self._log_optimization:
+          self._best_optimizer = where_improved(jnp.asarray(opt_idx),
+                                                self._best_optimizer)
         best_score = where_improved(score, best_score)
+
       return best_params
 
     return opt_fun
+
+  def get_last_opt_run(self) -> Tensor:
+    if not self._log_optimization:
+      raise ValueError('Optimizer not configured to collect objective values.')
+    # TODO: Make this jit compliant if it becomes necessary by padding
+    # things to size.
+    return self._optimizers[int(self._best_optimizer)].get_last_opt_run()

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,9 +61,9 @@ class InputUncertaintySpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     if self._layer_type == LayerType.INPUT:
       return self.solve_max_input(inner_dual_vars, opt_instance, key, step)
     elif self._layer_type == LayerType.FIRST:
@@ -75,9 +75,9 @@ class InputUncertaintySpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     assert opt_instance.is_first
     lb = opt_instance.bounds[0].lb
     ub = opt_instance.bounds[0].ub
@@ -117,9 +117,9 @@ class InputUncertaintySpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     theta = jnp.reshape(inner_dual_vars, [-1, 1])
     affine_fn, = opt_instance.affine_fns
     bounds = opt_instance.bounds
@@ -167,9 +167,9 @@ class ProbabilityThresholdSpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     assert opt_instance.is_last
     l = opt_instance.bounds[0].lb_pre
     u = opt_instance.bounds[0].ub_pre

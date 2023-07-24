@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,11 +38,11 @@ class BackpropagationTest(chex.TestCase):
     output_sensitivities = jnp.array([.1, .2, -.3])
     sensitivity_computation = backpropagation.SensitivityAlgorithm(
         jax_verify.ibp_transform, [(0,)], output_sensitivities)
-    bound_propagation.bound_propagation(sensitivity_computation,
+    bound_propagation.bound_propagation(sensitivity_computation,  # pytype: disable=wrong-arg-types  # jax-ndarray
                                         logits_fn, input_bounds)
     input_sensitivities, = sensitivity_computation.target_sensitivities
 
-    chex.assert_tree_all_close(input_sensitivities, jnp.array([.1, .2, -.3]))
+    chex.assert_trees_all_close(input_sensitivities, jnp.array([.1, .2, -.3]))
 
   def test_relu_network_applies_chord_slopes_to_sensitivities(self):
     # Set up some ReLUs, with a variety of input bounds:
@@ -57,13 +57,13 @@ class BackpropagationTest(chex.TestCase):
     output_sensitivities = jnp.array([10., 10., 10., 10., 10.])
     sensitivity_computation = backpropagation.SensitivityAlgorithm(
         jax_verify.ibp_transform, [(0,)], output_sensitivities)
-    bound_propagation.bound_propagation(sensitivity_computation,
+    bound_propagation.bound_propagation(sensitivity_computation,  # pytype: disable=wrong-arg-types  # jax-ndarray
                                         logits_fn, input_bounds)
     input_sensitivities, = sensitivity_computation.target_sensitivities
 
     # Expect blocking neurons to have no sensitivity, passing neurons to have
     # full sensitivity, and ambiguous neurons to interpolate between the two.
-    chex.assert_tree_all_close(
+    chex.assert_trees_all_close(
         input_sensitivities, jnp.array([0., 10., 5., 2., 6.]))
 
   def test_affine_network_applies_transpose_to_sensitivites(self):
@@ -81,12 +81,12 @@ class BackpropagationTest(chex.TestCase):
     output_sensitivities = jnp.array([[1., 0., -1.]])
     sensitivity_computation = backpropagation.SensitivityAlgorithm(
         jax_verify.ibp_transform, [(0,)], output_sensitivities)
-    bound_propagation.bound_propagation(sensitivity_computation,
+    bound_propagation.bound_propagation(sensitivity_computation,  # pytype: disable=wrong-arg-types  # jax-ndarray
                                         logits_fn, input_bounds)
     input_sensitivities, = sensitivity_computation.target_sensitivities
     # Expect the transpose of w to have been applied to the sensitivities.
     # The bias will be ignored.
-    chex.assert_tree_all_close(
+    chex.assert_trees_all_close(
         input_sensitivities, jnp.array([[6., -4.]]))
 
 

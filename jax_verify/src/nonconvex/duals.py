@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 import collections
 import functools
-from typing import Callable, Dict, Tuple, Union, List, DefaultDict, Optional
+from typing import Callable, DefaultDict, Mapping, MutableMapping, MutableSequence, Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -25,19 +25,16 @@ import jax.numpy as jnp
 from jax_verify.src import bound_propagation
 from jax_verify.src import synthetic_primitives
 from jax_verify.src.nonconvex import nonconvex
+from jax_verify.src.types import Index, Primitive, Tensor  # pylint: disable=g-multiple-import
 
-Tensor = jnp.ndarray
-Index = bound_propagation.Index
 ParamSet = nonconvex.ParamSet
 EvalFunArgs = [ParamSet, ParamSet, ParamSet]
 WolfeDualFn = Callable[[ParamSet, Tensor, ParamSet, Tensor, Tensor, ParamSet],
                        Tensor]
 LagrangianLevelFn = Callable[[Tensor, ParamSet], Tensor]
 LagrangianBoundingFn = Callable[[Tensor, ParamSet], Tensor]
-LagrangianVarTerm = Tuple[
-    Union[str, bound_propagation.Primitive],
-    Callable[..., Tensor]]
-LagrangianDict = DefaultDict[Index, List[LagrangianVarTerm]]
+LagrangianVarTerm = Tuple[Union[str, Primitive], Callable[..., Tensor]]
+LagrangianDict = DefaultDict[Index, MutableSequence[LagrangianVarTerm]]
 LagrangianVartermsFn = Callable[[Tensor, LagrangianDict], None]
 
 
@@ -80,9 +77,9 @@ class WolfeNonConvexBound(nonconvex.ConstrainedNonConvexBound):
       wolfe_dual_fn: WolfeDualFn,
       index: Index,
       shape: Tuple[int, ...],
-      previous_bounds: Dict[Index, 'WolfeNonConvexBound'],
+      previous_bounds: MutableMapping[Index, 'WolfeNonConvexBound'],
       eval_fn: Callable[EvalFunArgs, Tensor],
-      variables: Dict[Index, Tuple[int, ...]],
+      variables: Mapping[Index, Tuple[int, ...]],
       concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Create a NonConvexBound that can compute the WolfeDual.
 
@@ -133,11 +130,13 @@ class WolfeNonConvexBound(nonconvex.ConstrainedNonConvexBound):
       lb: Tensor,
       ub: Tensor) -> Callable[..., 'WolfeNonConvexBound']:
 
-    def wolfe_dual_fn(var_set: ParamSet,
-                      dvar: Tensor,
-                      acts: ParamSet,
-                      bound_lb: Tensor, bound_ub: Tensor,
-                      dual_vars: ParamSet) -> Tensor:
+    def wolfe_dual_fn(
+        var_set: ParamSet,
+        dvar: Tensor,
+        acts: ParamSet,
+        bound_lb: Tensor, bound_ub: Tensor,
+        dual_vars: ParamSet,
+    ) -> Tensor:
       del var_set
       del bound_lb
       del bound_ub
@@ -156,14 +155,17 @@ class WolfeNonConvexBound(nonconvex.ConstrainedNonConvexBound):
       cls: Callable[..., 'WolfeNonConvexBound'],
       index: Index,
       vlin_fun: Callable[..., Tensor],
-      in_vals: List[Union['WolfeNonConvexBound', Tensor]],
+      in_vals: Sequence[Union['WolfeNonConvexBound', Tensor]],
   ) -> Callable[..., 'WolfeNonConvexBound']:
 
-    def wolfe_dual_fn(var_set: ParamSet,
-                      dvar: Tensor,
-                      acts: ParamSet,
-                      bound_lb: Tensor, bound_ub: Tensor,
-                      dual_vars: ParamSet) -> Tensor:
+    def wolfe_dual_fn(
+        var_set: ParamSet,
+        dvar: Tensor,
+        acts: ParamSet,
+        bound_lb: Tensor,
+        bound_ub: Tensor,
+        dual_vars: ParamSet,
+    ) -> Tensor:
       pos_dvar = jnp.maximum(dvar, 0.)
       neg_dvar = jnp.maximum(-dvar, 0.)
       all_inps = [nonconvex.eval_if_nonconvexbound(inp, var_set, None, acts)
@@ -215,16 +217,20 @@ class WolfeNonConvexBound(nonconvex.ConstrainedNonConvexBound):
   def get_nonlinearity_activation_constructor(
       cls: Callable[..., 'WolfeNonConvexBound'],
       index: Index,
-      act_type: bound_propagation.Primitive,
+      act_type: Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor],
       *inp: 'WolfeNonConvexBound',
   ) -> Callable[..., 'WolfeNonConvexBound']:
-    def wolfe_dual_fn(var_set: ParamSet,
-                      dvar: Tensor,
-                      acts: ParamSet,
-                      bound_lb: Tensor, bound_ub: Tensor,
-                      dual_vars: ParamSet) -> Tensor:
+
+    def wolfe_dual_fn(
+        var_set: ParamSet,
+        dvar: Tensor,
+        acts: ParamSet,
+        bound_lb: Tensor,
+        bound_ub: Tensor,
+        dual_vars: ParamSet,
+    ) -> Tensor:
       pos_dvar = jnp.maximum(dvar, 0.)
       neg_dvar = jnp.maximum(-dvar, 0.)
       inp_val = [inp_i.evaluate(var_set, {}, acts) for inp_i in inp]
@@ -291,15 +297,16 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   the feasible domain is done through the `bounding_fn` function.
   """
 
-  def __init__(self,
-               lagrangian_level_fn: LagrangianLevelFn,
-               bounding_fn: LagrangianBoundingFn,
-               index: Index,
-               shape: Tuple[int, ...],
-               previous_bounds: Dict[Index, 'LinLagrangianNonConvexBound'],
-               eval_fn: Callable[EvalFunArgs, Tensor],
-               variables: Dict[Index, Tuple[int, ...]],
-               concretized_bounds: Optional[bound_propagation.Bound] = None):
+  def __init__(
+      self,
+      lagrangian_level_fn: LagrangianLevelFn,
+      bounding_fn: LagrangianBoundingFn,
+      index: Index,
+      shape: Tuple[int, ...],
+      previous_bounds: MutableMapping[Index, 'LinLagrangianNonConvexBound'],
+      eval_fn: Callable[EvalFunArgs, Tensor],
+      variables: Mapping[Index, Tuple[int, ...]],
+      concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Create a NonConvexBound that can compute the Linearized Lagrangian dual.
 
     Args:
@@ -356,7 +363,7 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       lag_grad = laggrad_wrt_acts[index]
       contrib = bounding_fn(lag_grad, acts)
       lin_duals += contrib
-    return primals, lin_duals
+    return primals, lin_duals  # pytype: disable=bad-return-type  # jax-ndarray
 
   @classmethod
   def get_initial_bound_constructor(
@@ -426,11 +433,11 @@ class LinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   def get_nonlinearity_activation_constructor(
       cls: Callable[..., 'LinLagrangianNonConvexBound'],
       index: Index,
-      act_type: bound_propagation.Primitive,
+      act_type: Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor],
       *inp: 'LinLagrangianNonConvexBound',
-      ) -> Callable[..., 'LinLagrangianNonConvexBound']:
+  ) -> Callable[..., 'LinLagrangianNonConvexBound']:
     assert len(inp) == 1
     inp = inp[0]
     def lagrangian_level_fn(dvar: Tensor, acts: ParamSet) -> Tensor:
@@ -479,14 +486,15 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   minimize it one variable at a time.
   """
 
-  def __init__(self,
-               lagrangian_varterms_fn: LagrangianVartermsFn,
-               index: Index,
-               shape: Tuple[int, ...],
-               previous_bounds: Dict[Index, 'MinLagrangianNonConvexBound'],
-               eval_fn: Callable[EvalFunArgs, Tensor],
-               variables: Dict[Index, Tuple[int, ...]],
-               concretized_bounds: Optional[bound_propagation.Bound] = None):
+  def __init__(
+      self,
+      lagrangian_varterms_fn: LagrangianVartermsFn,
+      index: Index,
+      shape: Tuple[int, ...],
+      previous_bounds: MutableMapping[Index, 'MinLagrangianNonConvexBound'],
+      eval_fn: Callable[EvalFunArgs, Tensor],
+      variables: Mapping[Index, Tuple[int, ...]],
+      concretized_bounds: Optional[bound_propagation.Bound] = None):
     """Create a NonConvexBound that can compute the primal minimized Lagrangian.
 
     Args:
@@ -544,7 +552,7 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
         out_term = lag_term_fn(opt_acts[index])
         minimized_lagrangian = minimized_lagrangian + _sum_over_acts(out_term)
 
-    return primals, minimized_lagrangian
+    return primals, minimized_lagrangian  # pytype: disable=bad-return-type  # jax-ndarray
 
   @classmethod
   def get_initial_bound_constructor(
@@ -562,7 +570,7 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
       cls: Callable[..., 'MinLagrangianNonConvexBound'],
       index: Index,
       vlin_fun: Callable[..., Tensor],
-      in_vals: List[Union['MinLagrangianNonConvexBound', Tensor]],
+      in_vals: Sequence[Union['MinLagrangianNonConvexBound', Tensor]],
   ) -> Callable[..., 'MinLagrangianNonConvexBound']:
 
     def lagrangian_varterms_fn(dvar: Tensor, lagrangian_dict: LagrangianDict):
@@ -581,7 +589,7 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
           inps = [inp if not is_bound else x
                   for inp, is_bound in zip(in_vals, inp_is_bound)]
           return dvar * vlin_fun(inps)
-        lagrangian_dict[in_vals[bound_arg_pos].index].append(
+        lagrangian_dict[in_vals[bound_arg_pos].index].append(  # pytype: disable=attribute-error  # jax-ndarray
             ('Linear', single_input_vlin_fun))
       else:
         # There is multiple inputs, so we need to separate the contribution of
@@ -619,11 +627,11 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
   def get_nonlinearity_activation_constructor(
       cls: Callable[..., 'MinLagrangianNonConvexBound'],
       index: Index,
-      act_type: bound_propagation.Primitive,
+      act_type: Primitive,
       lb_fun: Callable[[Tensor], Tensor],
       ub_fun: Callable[[Tensor], Tensor],
       *inp: 'MinLagrangianNonConvexBound',
-      ) -> Callable[..., 'MinLagrangianNonConvexBound']:
+  ) -> Callable[..., 'MinLagrangianNonConvexBound']:
     assert len(inp) == 1
     assert act_type in _lagrangian_opt_fns
     inp = inp[0]
@@ -645,7 +653,7 @@ class MinLagrangianNonConvexBound(nonconvex.NonConvexBound):
     return self._concretized_bounds is None
 
 
-def _optimize_lagrangian_terms(lagrangian_terms: List[LagrangianVarTerm],
+def _optimize_lagrangian_terms(lagrangian_terms: Sequence[LagrangianVarTerm],
                                lower_bound: Tensor,
                                upper_bound: Tensor) -> Tensor:
   """Minimize the part of the lagrangian corresponding to a given variable.

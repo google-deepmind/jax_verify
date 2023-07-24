@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,12 +22,11 @@ from typing import Callable, Sequence, Tuple, TypeVar, Union
 import jax
 import jax.numpy as jnp
 from jax_verify.src import bound_propagation
+from jax_verify.src.types import Nest, Tensor, TensorFun  # pylint: disable=g-multiple-import
 import numpy as np
 import urllib.request
 
 
-Tensor = bound_propagation.Tensor
-Bound = bound_propagation.Bound
 EPSILON = 1.e-12
 
 
@@ -58,17 +57,17 @@ def open_file(name, *open_args, root_dir='/tmp/jax_verify', **open_kwargs):
 
 
 def bind_nonbound_args(
-    fun: Callable[..., Tensor],
-    *all_in_args: Union[Bound, Tensor],
-    **kwargs
-) -> Callable[..., Tensor]:
+    fun: TensorFun,
+    *all_in_args: bound_propagation.LayerInput,
+    **kwargs,
+) -> TensorFun:
   """Take a function and bind all keyword arguments and non-bound arguments."""
 
   def tensorbound_fun(*bound_args):
     fun_inps = []
     bound_arg_pos = 0
     for arg in all_in_args:
-      if isinstance(arg, Bound):
+      if isinstance(arg, bound_propagation.Bound):
         fun_inps.append(bound_args[bound_arg_pos])
         bound_arg_pos += 1
       else:
@@ -96,9 +95,9 @@ def batch_value_and_grad(fun, batch_dims, *args, **kwargs):
   add_batch_dim = lambda x: jnp.expand_dims(x, batch_dims)
   remove_batch_dim = lambda x: x.squeeze(batch_dims)
   def nobatch_fun(*nobatch_inps):
-    batch_inps = jax.tree_util.tree_multimap(add_batch_dim, nobatch_inps)
+    batch_inps = jax.tree_util.tree_map(add_batch_dim, nobatch_inps)
     batch_out = fun(*batch_inps)
-    nobatch_out = jax.tree_util.tree_multimap(remove_batch_dim, batch_out)
+    nobatch_out = jax.tree_util.tree_map(remove_batch_dim, batch_out)
     return nobatch_out
   nobatch_value_and_grad = jax.value_and_grad(nobatch_fun, *args, **kwargs)
 
@@ -212,3 +211,15 @@ def fori_loop_no_backprop(
       lambda i_val: (i_val[0] + 1, body_fun(i_val[0], i_val[1])),
       (lower, init_val))
   return final_val
+
+
+def maybe_interp(vals: Sequence[Tensor], interp_params: Nest[Tensor]) -> Tensor:
+  if len(vals) == 1:
+    # Interpolation is trivial.
+    val, = vals
+    return val
+  else:
+    # Assume two pieces, so we can interpolate with a single parameter.
+    assert len(vals) == 2
+    val0, val1 = vals
+    return (1. - interp_params) * val0 + interp_params * val1

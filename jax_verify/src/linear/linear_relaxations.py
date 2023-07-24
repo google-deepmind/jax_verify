@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 """
 import abc
 import functools
-from typing import Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Callable, Generic, Mapping, Optional, Sequence, Tuple, TypeVar
 
 import jax
 from jax import lax
@@ -28,13 +28,13 @@ from jax_verify.src import graph_traversal
 from jax_verify.src import mccormick
 from jax_verify.src import synthetic_primitives
 from jax_verify.src import utils
+from jax_verify.src.types import ArgsKwargsCallable, Index, Nest, Primitive, Tensor, TensorFun  # pylint: disable=g-multiple-import
+import numpy as np
 
-Bound = bound_propagation.Bound
-Primitive = bound_propagation.Primitive
-Tensor = bound_propagation.Tensor
-Nest = bound_propagation.Nest
-LinFun = Callable[..., Tensor]
-TensorFun = activation_relaxation.TensorFunction
+LinFun = TensorFun
+# Representation of a linear function used in a relaxation.
+# Can be a linear jax function (LinFun), or can be a LinearExpression.
+LinearRelax = TypeVar('LinearRelax')
 
 
 class LinearExpression:
@@ -53,6 +53,10 @@ class LinearExpression:
   @property
   def shape(self):
     return self.offset.shape
+
+  @property
+  def dtype(self):
+    return self.offset.dtype
 
   def __add__(self, other):
     if isinstance(other, LinearExpression):
@@ -78,8 +82,75 @@ class LinearExpression:
     else:
       return LinearExpression(-self.lin_coeffs, other - self.offset,)
 
+  def __neg__(self):
+    return LinearExpression(-self.lin_coeffs, -self.offset)
+
   def __truediv__(self, other):
     return LinearExpression(self.lin_coeffs / other, self.offset / other)
+
+  def transpose(self, in_shape: Tuple[int]) -> 'LinearExpression':
+    """Transposes the LinearExpression.
+
+    Convert the linear expression that are in the format of:
+    [flattenned_in_shape, *out_shape]
+    to the alternative format, which is
+    [flattenned_out_shape, *unflattened_in_shape].
+
+    Args:
+      in_shape: Shape of the inputs to the linear functions. The product of the
+        dimension needs to match the leading dimension of the lincoeffs.
+
+    Returns:
+      Expression in the transposed format.
+    """
+    out_shape = self.offset.shape
+
+    flattened_out_shape = np.prod(out_shape)
+    coeffs_all_flattened = jnp.reshape(self.lin_coeffs,
+                                       (-1, flattened_out_shape))
+    transposed_flattened_coeffs = jnp.transpose(coeffs_all_flattened, (1, 0))
+    new_lin_coeffs = jnp.reshape(transposed_flattened_coeffs,
+                                 (flattened_out_shape, *in_shape))
+    new_offset = jnp.reshape(self.offset, (flattened_out_shape,))
+    return LinearExpression(new_lin_coeffs, new_offset)
+
+
+ConcretizationFn = Callable[[LinearExpression, graph_traversal.GraphInput],
+                            Tensor]
+
+
+def concretize_linear_expression(
+    linexp: LinearExpression,
+    input_bound: graph_traversal.InputBound) -> Tensor:
+  """Compute the lower bound value of a linear expression.
+
+  Args:
+    linexp: Coefficients of linear functions. The leading batch dimension
+      corresponds to different output neurons that need to be concretized. Shape
+      is [nb_linfun, *input_bound.shape]
+    input_bound: Bound on the activations of that layer. Its shape should match
+      the coefficients of the linear functions to concretize. Shape is
+      [*input_bound.shape]
+
+  Returns:
+    bound: A concretized bound on the value of the functions represented by
+      linexp. Shape is [nb_linfun]
+  """
+  return concretize_linear_function_interval_bounds(linexp, input_bound)
+
+
+def concretize_linear_function_interval_bounds(
+    linexp: LinearExpression,
+    input_bound: graph_traversal.InputBound) -> Tensor:
+  """Compute the lower bound of a linear function under interval constraints."""
+  act_lower = jnp.expand_dims(input_bound.lower, 0)
+  act_upper = jnp.expand_dims(input_bound.upper, 0)
+
+  dims_to_reduce = tuple(range(1, act_lower.ndim))
+
+  return linexp.offset + jnp.sum(
+      jnp.minimum(linexp.lin_coeffs, 0.) * act_upper +
+      jnp.maximum(linexp.lin_coeffs, 0.) * act_lower, dims_to_reduce)
 
 
 class LinearBoundsRelaxer(metaclass=abc.ABCMeta):
@@ -87,9 +158,9 @@ class LinearBoundsRelaxer(metaclass=abc.ABCMeta):
   @abc.abstractmethod
   def linearize_primitive(
       self,
-      index: graph_traversal.Index,
+      index: Index,
       primitive: Primitive,
-      *inps: Union[Bound, Tensor],
+      *inps: bound_propagation.LayerInput,
       **params) -> Tuple[LinFun, LinFun]:
     """Obtain the parameters of the linearized relaxation of a given primitive.
 
@@ -117,16 +188,19 @@ class OpwiseLinearBoundsRelaxer(LinearBoundsRelaxer):
 
   def __init__(
       self,
-      primitive_mapper: Dict[Primitive, Callable[..., Tuple[LinFun, LinFun]]],
+      primitive_mapper: Mapping[
+          Primitive,
+          ArgsKwargsCallable[
+              bound_propagation.LayerInput, Tuple[LinFun, LinFun]]],
       default_relaxer: Optional[LinearBoundsRelaxer] = None):
     self._primitive_mapper = primitive_mapper
     self._default_relaxer = default_relaxer
 
   def linearize_primitive(
       self,
-      index: graph_traversal.Index,
+      index: Index,
       primitive: Primitive,
-      *inps: Union[Bound, Tensor],
+      *inps: bound_propagation.LayerInput,
       **params) -> Tuple[LinFun, LinFun]:
     if primitive in self._primitive_mapper:
       params = synthetic_primitives.filter_jaxverify_kwargs(params)
@@ -138,10 +212,11 @@ class OpwiseLinearBoundsRelaxer(LinearBoundsRelaxer):
       raise ValueError(f'Unsupported primitive to relax: {primitive}.')
 
 
-class ParameterizedNodeRelaxation(metaclass=abc.ABCMeta):
+class ParameterizedNodeRelaxation(Generic[LinearRelax], metaclass=abc.ABCMeta):
   """Computes upper/lower linearisations using optimisable parameters."""
 
-  @abc.abstractproperty
+  @property
+  @abc.abstractmethod
   def arity(self) -> int:
     """Returns the number of input arguments expected by this relaxation."""
 
@@ -149,14 +224,14 @@ class ParameterizedNodeRelaxation(metaclass=abc.ABCMeta):
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inps: Union[Bound, Tensor],
-  ) -> Tuple[LinFun, LinFun]:
+      *inps: bound_propagation.LayerInput,
+  ) -> Tuple[LinearRelax, LinearRelax]:
     """Returns linearised relaxation for given optimisable parameters."""
 
   @abc.abstractmethod
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     """Returns initial values of optimisable parameters."""
 
@@ -171,19 +246,16 @@ class ParameterizedLinearBoundsRelaxer(metaclass=abc.ABCMeta):
   @abc.abstractmethod
   def parameterized_linearizer(
       self,
-      index: graph_traversal.Index,
+      index: Index,
       primitive: Primitive,
-      *input_shapes: Sequence[int],
-      **params) -> ParameterizedNodeRelaxation:
+      *input_info: Tuple[Sequence[int], bool],
+      **params) -> ParameterizedNodeRelaxation[LinFun]:
     """Obtain a parameterised family of linear relaxations of a given primitive.
-
-    The relaxations hold when the inputs are within range of the bounds
-    described by `inps`.
 
     Args:
       index: Index of the node in the bound propagation.
       primitive: Primitive to relax.
-      *input_shapes: Shapes of the inputs of the primitive.
+      *input_info: Tuples of (shape, is_bound) of the inputs of the primitive.
       **params: Parameters of the primitive.
     Returns:
       Object producing linearised lower/upper bounds given relaxation
@@ -196,24 +268,88 @@ class OpwiseParameterizedLinearBoundsRelaxer(ParameterizedLinearBoundsRelaxer):
 
   def __init__(
       self,
-      primitive_mapper: Dict[
-          Primitive, Callable[..., ParameterizedNodeRelaxation]],
+      primitive_mapper: Mapping[
+          Primitive,
+          ArgsKwargsCallable[Sequence[int],
+                             ParameterizedNodeRelaxation[LinFun]]],
       default_param_relaxer: Optional[ParameterizedLinearBoundsRelaxer] = None):
     self._primitive_mapper = primitive_mapper
     self._default_parameterized_relaxer = default_param_relaxer
 
   def parameterized_linearizer(
       self,
-      index: graph_traversal.Index,
+      index: Index,
       primitive: Primitive,
-      *input_shapes: Sequence[int],
-      **params) -> ParameterizedNodeRelaxation:
+      *input_info: Tuple[Sequence[int], bool],
+      **params) -> ParameterizedNodeRelaxation[LinFun]:
     if primitive in self._primitive_mapper:
       params = synthetic_primitives.filter_jaxverify_kwargs(params)
-      return self._primitive_mapper[primitive](*input_shapes, **params)
+      return self._primitive_mapper[primitive](*input_info, **params)
     elif self._default_parameterized_relaxer:
       return self._default_parameterized_relaxer.parameterized_linearizer(
-          index, primitive, *input_shapes, **params)
+          index, primitive, *input_info, **params)
+    else:
+      raise ValueError(f'Unsupported primitive to relax: {primitive}.')
+
+
+class ParameterizedLinearBoundsGlobalRelaxer(metaclass=abc.ABCMeta):
+  """Relaxer mapping each primitive to an optimisable linear propagator."""
+
+  @abc.abstractmethod
+  def parameterized_global_linearizer(
+      self,
+      index: Index,
+      primitive: Primitive,
+      network_input_spec: bound_propagation.Bound,
+      *input_shapes: Sequence[int],
+      **params) -> ParameterizedNodeRelaxation[LinearExpression]:
+    """Obtain a parameterised family of linear bound propagator.
+
+    Compared to the non-global version, this requires the additional
+    network_input_spec parameters.
+
+    Args:
+      index: Index of the node in the bound propagation.
+      primitive: Primitive to relax.
+      network_input_spec: Bound over the input of the network.
+      *input_shapes: Shapes of the inputs of the primitive.
+      **params: Parameters of the primitive.
+
+    Returns:
+      Object producing linearised lower/upper bounds given relaxation
+      parameters.
+    """
+
+
+class OpwiseParameterizedLinearBoundsGlobalRelaxer(
+    ParameterizedLinearBoundsGlobalRelaxer):
+  """Relaxer mapping each primitive to a parameterized linear relaxation."""
+
+  def __init__(
+      self,
+      primitive_mapper: Mapping[
+          Primitive,
+          Callable[..., ParameterizedNodeRelaxation[LinearExpression]]],
+      default_param_relaxer: Optional[ParameterizedLinearBoundsGlobalRelaxer
+                                      ] = None):
+    self._primitive_mapper = primitive_mapper
+    self._default_parameterized_relaxer = default_param_relaxer
+
+  def parameterized_global_linearizer(
+      self,
+      index: Index,
+      primitive: Primitive,
+      network_input_spec: bound_propagation.Bound,
+      *input_shapes: Sequence[int],
+      **params) -> ParameterizedNodeRelaxation[LinearExpression]:
+    if primitive in self._primitive_mapper:
+      params = synthetic_primitives.filter_jaxverify_kwargs(params)
+      return self._primitive_mapper[primitive](network_input_spec,
+                                               *input_shapes, **params)
+    elif self._default_parameterized_relaxer:
+      return (
+          self._default_parameterized_relaxer.parameterized_global_linearizer(
+              index, primitive, network_input_spec, *input_shapes, **params))
     else:
       raise ValueError(f'Unsupported primitive to relax: {primitive}.')
 
@@ -223,27 +359,27 @@ class BindRelaxerParams(LinearBoundsRelaxer):
 
   def __init__(
       self,
-      node_relaxations: Dict[
-          graph_traversal.Index, ParameterizedNodeRelaxation],
-      relax_params: Dict[graph_traversal.Index, Tensor],
+      node_relaxations: Mapping[Index, ParameterizedNodeRelaxation[LinFun]],
+      relax_params: Mapping[Index, Tensor],
   ):
     self._node_relaxations = node_relaxations
     self._relax_params = relax_params
 
   def linearize_primitive(
       self,
-      index: graph_traversal.Index,
+      index: Index,
       primitive: Primitive,
-      *inps: Union[Bound, Tensor],
+      *inps: bound_propagation.LayerInput,
       **params) -> Tuple[LinFun, LinFun]:
     return self._node_relaxations[index].linearize(
         self._relax_params[index], *inps)
 
 
-class ParameterizedLinFun(metaclass=abc.ABCMeta):
+class ParameterizedLinFun(Generic[LinearRelax], metaclass=abc.ABCMeta):
   """Linearisation of lower OR upper bound using optimisable parameters."""
 
-  @abc.abstractproperty
+  @property
+  @abc.abstractmethod
   def arity(self) -> int:
     """Returns the number of input arguments expected by the linear function."""
 
@@ -251,14 +387,14 @@ class ParameterizedLinFun(metaclass=abc.ABCMeta):
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inps: Union[Bound, Tensor],
-  ) -> LinFun:
+      *inps: bound_propagation.LayerInput,
+  ) -> LinearRelax:
     """Returns linearised half-bound for given optimisable parameters."""
 
   @abc.abstractmethod
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     """Returns initial values of optimisable parameters."""
 
@@ -267,11 +403,11 @@ class ParameterizedLinFun(metaclass=abc.ABCMeta):
     """Projects optimisable parameters to their valid domain."""
 
 
-class LowerUpperRelaxation(ParameterizedNodeRelaxation):
+class LowerUpperRelaxation(ParameterizedNodeRelaxation[LinearRelax]):
   """Adapts two parameterised half-bounds into a parameterised relaxation."""
 
-  def __init__(
-      self, lower: ParameterizedLinFun, upper: ParameterizedLinFun):
+  def __init__(self, lower: ParameterizedLinFun[LinearRelax],
+               upper: ParameterizedLinFun[LinearRelax]):
     super().__init__()
     self._lower = lower
     self._upper = upper
@@ -283,8 +419,8 @@ class LowerUpperRelaxation(ParameterizedNodeRelaxation):
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inps: Union[Bound, Tensor],
-  ) -> Tuple[LinFun, LinFun]:
+      *inps: bound_propagation.LayerInput,
+  ) -> Tuple[LinearRelax, LinearRelax]:
     lower_relax_params, upper_relax_params = relax_params
     return (
         self._lower.linearize(lower_relax_params, *inps),
@@ -292,7 +428,7 @@ class LowerUpperRelaxation(ParameterizedNodeRelaxation):
 
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     return (
         self._lower.initial_params(*inps),
@@ -305,32 +441,33 @@ class LowerUpperRelaxation(ParameterizedNodeRelaxation):
         self._upper.project_params(upper_relax_params))
 
 
-class _NoParamRelaxation(ParameterizedNodeRelaxation):
+class _NoParamRelaxation(ParameterizedNodeRelaxation[LinearRelax]):
   """Adapts a simple relaxer function into a zero-parameter relaxer function."""
 
   def __init__(
       self,
-      relaxer: Callable[..., Tuple[LinFun, LinFun]],
-      *input_shapes: Sequence[int],
+      relaxer: ArgsKwargsCallable[
+          bound_propagation.LayerInput, Tuple[LinFun, LinFun]],
+      *input_info: Tuple[Sequence[int], bool],
       **params):
     self._relaxer = relaxer
-    self._input_shapes = input_shapes
+    self._input_info = input_info
     self._params = params
 
   @property
   def arity(self):
-    return len(self._input_shapes)
+    return len(self._input_info)
 
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inps: Union[Bound, Tensor],
-  ) -> Tuple[LinFun, LinFun]:
+      *inps: bound_propagation.LayerInput,
+  ) -> Tuple[LinearRelax, LinearRelax]:
     return self._relaxer(*inps, **self._params)
 
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     return ()
 
@@ -341,48 +478,48 @@ class _NoParamRelaxation(ParameterizedNodeRelaxation):
 no_params = lambda relaxer: functools.partial(_NoParamRelaxation, relaxer)
 
 
-def linearized(fn: Callable[..., Tensor], *primals: Tensor) -> LinFun:
+def linearized(fn: TensorFun, *primals: Tensor) -> LinFun:
   """Returns linear function that is tangent to `fn` at given primal point."""
   val, deriv = jax.linearize(fn, *primals)
   return lambda *xs: val + deriv(*[x - p for x, p in zip(xs, primals)])
 
 
-class SupportingHyperplane(ParameterizedLinFun):
+class SupportingHyperplane(ParameterizedLinFun[LinFun]):
   """Linearisation of primitive, parameterised by primal point."""
 
   def __init__(
       self,
       fn: TensorFun,
-      *input_shapes: Sequence[int]):
+      *input_info: Tuple[Sequence[int], bool]):
     super().__init__()
     self._fn = fn
-    self._input_shapes = input_shapes
+    self._input_info = input_info
 
   @property
   def arity(self) -> int:
-    return len(self._input_shapes)
+    return len(self._input_info)
 
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inps: Union[Bound, Tensor],
+      *inps: bound_propagation.LayerInput,
   ) -> LinFun:
     primals = [
         alpha * inp.upper + (1.-alpha) * inp.lower
-        if isinstance(inp, Bound) else inp
+        if isinstance(inp, bound_propagation.Bound) else inp
         for inp, alpha in zip(inps, relax_params)]
     return linearized(self._fn, *primals)
 
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     # If an input is [known to be] a fixed tensor, don't allocate a
     # relaxation parameter for it.
-    return [
+    return [  # pytype: disable=bad-return-type  # jax-ndarray
         .5 * jnp.ones(shape=inp_shape)
-        if inp is None or isinstance(inp, Bound) else None
-        for inp, inp_shape in zip(inps, self._input_shapes)]
+        if inp is None or isinstance(inp, bound_propagation.Bound) else None
+        for inp, (inp_shape, _) in zip(inps, self._input_info)]
 
   def project_params(self, relax_params: Nest[Tensor]) -> Nest[Tensor]:
     return jax.tree_map(lambda x: jnp.clip(x, 0., 1.), relax_params)
@@ -392,7 +529,7 @@ def eltwise_linfun_from_coeff(slope: Tensor, offset: Tensor) -> LinFun:
   return lambda x: slope * x + offset
 
 
-class ElementwiseChord(ParameterizedLinFun):
+class ElementwiseChord(ParameterizedLinFun[LinFun]):
   """Chord between input bounds of an element-wise primitive."""
 
   arity = 1
@@ -400,15 +537,15 @@ class ElementwiseChord(ParameterizedLinFun):
   def __init__(
       self,
       fn: TensorFun,
-      input_shape: Sequence[int]):
+      input_info: Tuple[Sequence[int], bool]):
     super().__init__()
     self._fn = fn
-    self._input_shape = input_shape
+    self._input_info = input_info
 
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      inp: Union[Bound, Tensor],
+      inp: bound_propagation.LayerInput,
   ) -> LinFun:
     inp_lower, inp_upper = inp.lower, inp.upper
     outp_lower, outp_upper = self._fn(inp_lower), self._fn(inp_upper)
@@ -427,7 +564,7 @@ class ElementwiseChord(ParameterizedLinFun):
 
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     return ()
 
@@ -437,21 +574,21 @@ class ElementwiseChord(ParameterizedLinFun):
 
 def elementwise_convex_fn_relaxer(
     primitive: Primitive,
-    input_shape: Sequence[int],
-    **params) -> ParameterizedNodeRelaxation:
+    input_info: Tuple[Sequence[int], bool],
+    **params) -> ParameterizedNodeRelaxation[LinFun]:
   fn = functools.partial(primitive.bind, **params)
-  lower = SupportingHyperplane(fn, input_shape)
-  upper = ElementwiseChord(fn, input_shape)
+  lower = SupportingHyperplane(fn, input_info)
+  upper = ElementwiseChord(fn, input_info)
   return LowerUpperRelaxation(lower, upper)
 
 
 def elementwise_concave_fn_relaxer(
     primitive: Primitive,
-    input_shape: Sequence[int],
-    **params) -> ParameterizedNodeRelaxation:
+    input_info: Tuple[Sequence[int], bool],
+    **params) -> ParameterizedNodeRelaxation[LinFun]:
   fn = functools.partial(primitive.bind, **params)
-  lower = ElementwiseChord(fn, input_shape)
-  upper = SupportingHyperplane(fn, input_shape)
+  lower = ElementwiseChord(fn, input_info)
+  upper = SupportingHyperplane(fn, input_info)
   return LowerUpperRelaxation(lower, upper)
 
 
@@ -460,29 +597,29 @@ class _SmoothConvexRelaxation(LowerUpperRelaxation):
 
   def __init__(
       self,
-      convex_relaxer: Callable[..., Tuple[TensorFun, TensorFun]],
-      *input_shapes: Sequence[int],
+      convex_relaxer: activation_relaxation.RelaxationFn,
+      *input_info: Tuple[Sequence[int], bool],
       **params):
     # Create a skeleton `ParameterizedLinFun` for initialisation and projection
     # relaxation parameters. This doesn't need the lower/upper bound functions.
-    skeleton = SupportingHyperplane((lambda *_: None), *input_shapes)
+    skeleton = SupportingHyperplane((lambda *_: None), *input_info)
     super().__init__(skeleton, skeleton)
 
     self._convex_relaxer = convex_relaxer
-    self._input_shapes = input_shapes
+    self._input_info = input_info
     self._params = params
 
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inps: Union[Bound, Tensor],
+      *inps: bound_propagation.LayerInput,
   ) -> Tuple[LinFun, LinFun]:
     # First obtain convex lower and concave upper bounds.
     # Do so at this late stage because they depend on the current input bounds.
     lb_fun, ub_fun = self._convex_relaxer(*inps, **self._params)
 
-    lower = SupportingHyperplane(lb_fun, *self._input_shapes)
-    upper = SupportingHyperplane(ub_fun, *self._input_shapes)
+    lower = SupportingHyperplane(lb_fun, *self._input_info)
+    upper = SupportingHyperplane(ub_fun, *self._input_info)
 
     lower_relax_params, upper_relax_params = relax_params
     return (
@@ -491,14 +628,14 @@ class _SmoothConvexRelaxation(LowerUpperRelaxation):
 
 
 def linear_from_smooth_convex(
-    convex_relaxer: Callable[..., Tuple[TensorFun, TensorFun]],
-) -> Callable[..., ParameterizedNodeRelaxation]:
+    convex_relaxer: activation_relaxation.RelaxationFn,
+) -> ArgsKwargsCallable[Sequence[int], ParameterizedNodeRelaxation]:
   return functools.partial(_SmoothConvexRelaxation, convex_relaxer)
 
 
 def midpoint_relaxer(
     primitive: Primitive,
-    *inputs: Union[Tensor, Bound],
+    *inputs: bound_propagation.LayerInput,
     convex: bool = False,
     **params) -> Tuple[LinFun, LinFun]:
   """Obtains relaxation by linearising convex relaxation about the midpoint.
@@ -518,14 +655,16 @@ def midpoint_relaxer(
   lb_fun, ub_fun = activation.relaxation_fn(*inputs, **params)
 
   mid_points = [
-      0.5 * (x.lower + x.upper) if isinstance(x, Bound) else x for x in inputs]
+      0.5 * (x.lower + x.upper)
+      if isinstance(x, bound_propagation.Bound) else x for x in inputs]
 
   lb_lin_fun = linearized(lb_fun, *mid_points)
   ub_lin_fun = ub_fun if convex else linearized(ub_fun, *mid_points)
   return lb_lin_fun, ub_lin_fun
 
 
-def _fastlin_relu_relaxer(inp: Bound) -> Tuple[LinFun, LinFun]:
+def _fastlin_relu_relaxer(
+    inp: bound_propagation.Bound) -> Tuple[LinFun, LinFun]:
   """Obtain the parameters of a linear ReLU relaxation as in FastLin.
 
   This relaxes the ReLU with the parallel bounds of slope (ub) / (ub - lb)
@@ -553,7 +692,7 @@ def _fastlin_relu_relaxer(inp: Bound) -> Tuple[LinFun, LinFun]:
           eltwise_linfun_from_coeff(slope, ub_offset))
 
 
-def _rvt_exp_relaxer(inp: Bound) -> Tuple[LinFun, LinFun]:
+def _rvt_exp_relaxer(inp: bound_propagation.Bound) -> Tuple[LinFun, LinFun]:
   """Obtain the parameters of a linear exp relaxation as in RVT.
 
   Lower bound is obtained based on tangent, due to convexity.
@@ -606,8 +745,8 @@ def _rvt_exp_relaxer(inp: Bound) -> Tuple[LinFun, LinFun]:
 
 
 def _rvt_posbilinear_relaxer(
-    x: Bound,
-    y: Bound,
+    x: bound_propagation.Bound,
+    y: bound_propagation.Bound,
     **params) -> Tuple[LinFun, LinFun]:
   """Obtains the parameters of a linear relaxation of a bilinear function.
 
@@ -633,24 +772,18 @@ def _rvt_posbilinear_relaxer(
   return lb_fun, ub_fun
 
 
-def _maybe_interp(
+def _maybe_interp_funs(
     funs: Sequence[TensorFun],
     interp_params: Nest[Tensor],
-    *args: Tensor
+    *args: Tensor,
 ) -> Tensor:
   """Interpolates between `funs` according to the given interpolation params."""
-  if len(funs) == 1:
-    # Interpolation is trivial.
-    fun, = funs
-    return fun(*args)
-  else:
-    # Assume two pieces, so we can interpolate with a single parameter.
-    assert len(funs) == 2
-    fun0, fun1 = funs
-    return (1.-interp_params) * fun0(*args) + interp_params * fun1(*args)
+  vals = [fun(*args) for fun in funs]
+  return utils.maybe_interp(vals, interp_params)
 
 
-class ParameterizedPiecewiseLinearSubgradient(ParameterizedNodeRelaxation):
+class ParameterizedPiecewiseLinearSubgradient(
+    ParameterizedNodeRelaxation[LinFun]):
   """Relaxation of a piecewise-linear function.
 
   This implementation currently assumes exactly two pieces.
@@ -658,38 +791,38 @@ class ParameterizedPiecewiseLinearSubgradient(ParameterizedNodeRelaxation):
 
   def __init__(
       self,
-      primitive: synthetic_primitives.PrimitiveLike,
-      piecewise_linear_relaxation_fn: Callable[..., Tuple[
-          Sequence[TensorFun], Sequence[TensorFun]]],
-      *input_shapes: Sequence[int],
+      primitive: Primitive,
+      piecewise_linear_relaxation_fn: (
+          activation_relaxation.PiecewiseLinearRelaxationFn),
+      *input_info: Tuple[Sequence[int], bool],
       soft_init: bool = True,
       **params):
     super().__init__()
     self._primitive = primitive
     self._piecewise_linear_relaxation_fn = piecewise_linear_relaxation_fn
-    self._input_shapes = input_shapes
+    self._input_info = input_info
     self._soft_init = soft_init
     self._params = params
 
   @property
   def arity(self):
-    return len(self._input_shapes)
+    return len(self._input_info)
 
   def linearize(
       self,
       relax_params: Nest[Tensor],
-      *inputs: Union[Bound, Tensor],
+      *inputs: bound_propagation.LayerInput,
   ) -> Tuple[LinFun, LinFun]:
     lb_funs, ub_funs = self._piecewise_linear_relaxation_fn(*inputs,
                                                             **self._params)
     lb_relax_params, ub_relax_params = relax_params
     return (
-        functools.partial(_maybe_interp, lb_funs, lb_relax_params),
-        functools.partial(_maybe_interp, ub_funs, ub_relax_params))
+        functools.partial(_maybe_interp_funs, lb_funs, lb_relax_params),
+        functools.partial(_maybe_interp_funs, ub_funs, ub_relax_params))
 
   def initial_params(
       self,
-      *inps: Optional[Union[Bound, Tensor]],
+      *inps: Optional[bound_propagation.LayerInput],
   ) -> Nest[Tensor]:
     if len(inps) == 1 and self._soft_init:
       soft_init_inp, = inps
@@ -712,50 +845,53 @@ class ParameterizedPiecewiseLinearSubgradient(ParameterizedNodeRelaxation):
       # Include an interpolation parameter for each output.
       output_shape = jax.eval_shape(
           self._primitive.bind,
-          *[jnp.zeros(shape) for shape in self._input_shapes],
+          *[jnp.zeros(shape) for shape, _ in self._input_info],
           **self._params).shape
       params = .5 * jnp.ones(shape=output_shape, dtype=jnp.float32)
 
     # Determine the number of linear pieces of the lower and upper bounds.
     lb_funs, ub_funs = self._piecewise_linear_relaxation_fn(
-        *[bound_propagation.IntervalBound(jnp.zeros(shape), jnp.zeros(shape))
-          for shape in self._input_shapes],
-        **self._params)
+        *[
+            bound_propagation.IntervalBound(jnp.zeros(shape), jnp.zeros(shape))
+            if is_bound else jnp.zeros(shape)
+            for shape, is_bound in self._input_info
+        ], **self._params)
 
-    return (
-        () if len(lb_funs) <= 1 else params,
-        () if len(ub_funs) <= 1 else params)
+    return (() if len(lb_funs) <= 1 else params,
+            () if len(ub_funs) <= 1 else params)
 
   def project_params(self, relax_params: Nest[Tensor]) -> Nest[Tensor]:
     return jax.tree_map(lambda x: jnp.clip(x, 0., 1.), relax_params)
 
 
-_crown_mapper = {
-    primitive: functools.partial(
-        midpoint_relaxer, primitive, convex=activation.convex)
-    for primitive, activation in activation_relaxation.relaxation_fns.items()}
-_crown_mapper.update({
+_crown_mapper: Mapping[
+    Primitive,
+    ArgsKwargsCallable[bound_propagation.LayerInput, Tuple[LinFun, LinFun]],
+] = {
+    **{prim: functools.partial(midpoint_relaxer, prim, convex=activation.convex)
+       for prim, activation in activation_relaxation.relaxation_fns.items()},
     lax.exp_p: _rvt_exp_relaxer,
     synthetic_primitives.posbilinear_p: _rvt_posbilinear_relaxer,
-})
+}
 crown_rvt_relaxer = OpwiseLinearBoundsRelaxer(_crown_mapper)
 
-_fastlin_mapper = {
-    primitive: functools.partial(
-        midpoint_relaxer, primitive, convex=activation.convex)
-    for primitive, activation in activation_relaxation.relaxation_fns.items()}
-_fastlin_mapper.update({
+_fastlin_mapper: Mapping[
+    Primitive,
+    ArgsKwargsCallable[bound_propagation.LayerInput, Tuple[LinFun, LinFun]],
+] = {
+    **{prim: functools.partial(midpoint_relaxer, prim, convex=activation.convex)
+       for prim, activation in activation_relaxation.relaxation_fns.items()},
     synthetic_primitives.relu_p: _fastlin_relu_relaxer,
     lax.exp_p: _rvt_exp_relaxer,
     synthetic_primitives.posbilinear_p: _rvt_posbilinear_relaxer,
-})
+}
 fastlin_rvt_relaxer = OpwiseLinearBoundsRelaxer(_fastlin_mapper)
 
 
 def _make_parameterized_relaxer(
-    primitive: synthetic_primitives.PrimitiveLike,
+    primitive: Primitive,
     activation: activation_relaxation.ActivationRelaxation,
-) -> Callable[..., ParameterizedNodeRelaxation]:
+) -> ArgsKwargsCallable[Sequence[int], ParameterizedNodeRelaxation]:
   """Makes a linear relaxation based on the given convex relatation."""
   if activation.piecewise_linear_relaxation_fn:
     return functools.partial(
@@ -769,7 +905,10 @@ def _make_parameterized_relaxer(
     return linear_from_smooth_convex(activation.relaxation_fn)
 
 
-_parameterized_mapper = {
+_parameterized_mapper: Mapping[
+    Primitive,
+    ArgsKwargsCallable[Sequence[int], ParameterizedNodeRelaxation],
+] = {
     primitive: _make_parameterized_relaxer(primitive, activation)
     for primitive, activation in activation_relaxation.relaxation_fns.items()}
 parameterized_relaxer = OpwiseParameterizedLinearBoundsRelaxer(

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,13 +44,13 @@ def _random_objectives_primal_variables(rng_key, nonconvex_bound,
                                         nb_opt_targets):
   # Get a set of primal variables
   var_set = {}
-  for pos, var_shape in nonconvex_bound.variables.items():
+  for pos, var_shape in nonconvex_bound.variables.items():  # pytype: disable=attribute-error  # jax-ndarray
     rng_key, new_key = jax.random.split(rng_key)
     var_set[pos] = jax.random.uniform(
         new_key, shape=(nb_opt_targets, *var_shape))
 
   objectives_dict = {}
-  for index, prev_bound in nonconvex_bound.previous_bounds.items():
+  for index, prev_bound in nonconvex_bound.previous_bounds.items():  # pytype: disable=attribute-error  # jax-ndarray
     rng_key, new_key = jax.random.split(rng_key)
     bound_shape = prev_bound.shape
     linfun_shape = (nb_opt_targets, *bound_shape)
@@ -205,7 +205,7 @@ class NonConvexBoundTest(parameterized.TestCase):
     objectives, var_set = _random_objectives_primal_variables(
         var_key, nonconvex_ibp_bounds, nb_opt_targets)
 
-    primal, dual = nonconvex_ibp_bounds.dual(var_set, objectives)
+    primal, dual = nonconvex_ibp_bounds.dual(var_set, objectives)  # pytype: disable=attribute-error  # jax-ndarray
     self.assertTrue((dual <= primal).all())
 
   def test_collect_lagrangian_layers(self):
@@ -233,7 +233,7 @@ class NonConvexBoundTest(parameterized.TestCase):
 
     objectives, var_set = _random_objectives_primal_variables(
         primal_var_key, linlag_bound, nb_opt_targets)
-    _, acts = linlag_bound.primal_fn(var_set, objectives)
+    _, acts = linlag_bound.primal_fn(var_set, objectives)  # pytype: disable=attribute-error  # jax-ndarray
 
     dual_vars = {}
     for index, primal_var in var_set.items():
@@ -241,12 +241,12 @@ class NonConvexBoundTest(parameterized.TestCase):
       dual_vars[index] = jax.random.normal(new_key, shape=primal_var.shape)
 
     ## Test separately each layers
-    for index in linlag_bound.previous_bounds:
-      linlag_intermediate_bound = linlag_bound.previous_bounds[index]
-      minlag_intermediate_bound = minlag_bound.previous_bounds[index]
+    for index in linlag_bound.previous_bounds:  # pytype: disable=attribute-error  # jax-ndarray
+      linlag_intermediate_bound = linlag_bound.previous_bounds[index]  # pytype: disable=attribute-error  # jax-ndarray
+      minlag_intermediate_bound = minlag_bound.previous_bounds[index]  # pytype: disable=attribute-error  # jax-ndarray
 
-      lagrangian_level_fn = linlag_intermediate_bound.lagrangian_level_fn
-      lagrangian_varterms_fn = minlag_intermediate_bound.lagrangian_varterms_fn
+      lagrangian_level_fn = linlag_intermediate_bound.lagrangian_level_fn  # pytype: disable=attribute-error  # jax-ndarray
+      lagrangian_varterms_fn = minlag_intermediate_bound.lagrangian_varterms_fn  # pytype: disable=attribute-error  # jax-ndarray
 
       dvar = dual_vars[index]
       # Get all the per variables term for a level, and evaluate them
@@ -291,14 +291,14 @@ class NonConvexBoundTest(parameterized.TestCase):
 
     objectives, var_set = _random_objectives_primal_variables(
         primal_var_key, minlag_bound, nb_opt_targets)
-    primal, acts = minlag_bound.primal_fn(var_set, objectives)
+    primal, acts = minlag_bound.primal_fn(var_set, objectives)  # pytype: disable=attribute-error  # jax-ndarray
 
     dual_vars = {}
     for index, primal_var in var_set.items():
       dual_var_key, new_key = jax.random.split(dual_var_key)
       dual_vars[index] = jax.random.normal(new_key, shape=primal_var.shape)
 
-    all_lagrangian_terms = minlag_bound.collect_lagrangian_varterms(
+    all_lagrangian_terms = minlag_bound.collect_lagrangian_varterms(  # pytype: disable=attribute-error  # jax-ndarray
         objectives, dual_vars)
     per_var_lagrangian = primal
     for var_index, lag_terms in all_lagrangian_terms.items():
@@ -307,7 +307,7 @@ class NonConvexBoundTest(parameterized.TestCase):
         dims_to_reduce = tuple(range(1, all_contrib.ndim))
         var_contrib = all_contrib.sum(axis=dims_to_reduce)
         per_var_lagrangian = per_var_lagrangian + var_contrib
-    per_level_lagrangian, _ = linlag_bound._lagrangian_fn(acts, objectives,
+    per_level_lagrangian, _ = linlag_bound._lagrangian_fn(acts, objectives,  # type: ignore  # jax-ndarray
                                                           dual_vars)
     diff = jnp.abs(per_level_lagrangian - per_var_lagrangian).max()
     self.assertAlmostEqual(
@@ -316,12 +316,12 @@ class NonConvexBoundTest(parameterized.TestCase):
     # Let's also sanity check that we can correctly optimize our lagrangian
     # terms.
     for var_idx, lag_terms in all_lagrangian_terms.items():
-      lower = minlag_bound.previous_bounds[var_idx].lower
+      lower = minlag_bound.previous_bounds[var_idx].lower  # pytype: disable=attribute-error  # jax-ndarray
       lower = jnp.repeat(jnp.expand_dims(lower, 0), nb_opt_targets, axis=0)
-      upper = minlag_bound.previous_bounds[var_idx].upper
+      upper = minlag_bound.previous_bounds[var_idx].upper  # pytype: disable=attribute-error  # jax-ndarray
       upper = jnp.repeat(jnp.expand_dims(upper, 0), nb_opt_targets, axis=0)
 
-      def eval_lagrangian_terms(var_act):
+      def eval_lagrangian_terms(var_act, lag_terms=lag_terms):
         per_var_lagrangians = []
         for term in lag_terms:
           out_term = term[1](var_act)
@@ -371,7 +371,7 @@ class NonConvexBoundTest(parameterized.TestCase):
     cvxpy_final_var, env = bound_propagation.bound_propagation(
         bound_propagation.ForwardPropagationAlgorithm(relaxation_transform),
         fun, input_bounds)
-    nb_targets = np.prod(cvxpy_final_var.shape[1:])
+    nb_targets = np.prod(cvxpy_final_var.shape[1:])  # pytype: disable=attribute-error  # jax-ndarray
     for batch_index in range(batch_size):
       for target_index in range(nb_targets):
         objective = (jnp.arange(nb_targets) == target_index).astype(jnp.float32)

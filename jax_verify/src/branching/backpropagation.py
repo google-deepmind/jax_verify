@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,25 +25,22 @@ Adversarial Polytope", https://arxiv.org/pdf/1711.00851.pdf.
 """
 
 import functools
-from typing import Callable, Dict, Optional, Sequence, Union
+from typing import Mapping, Optional, Sequence, Union
 
 import jax
 from jax import lax
 import jax.numpy as jnp
 from jax_verify.src import bound_propagation
+from jax_verify.src import graph_traversal
 from jax_verify.src import synthetic_primitives
-
-Bound = bound_propagation.Bound
-Index = bound_propagation.Index
-Tensor = bound_propagation.Tensor
-Nest = bound_propagation.Nest
+from jax_verify.src.types import Index, Nest, Primitive, Tensor  # pylint: disable=g-multiple-import
 
 
 def _sensitivity_linear_op(
-    primitive: jax.core.Primitive,
-    outval: jnp.ndarray,
-    *args: Union[bound_propagation.Bound, jnp.ndarray],
-    **kwargs) -> Sequence[Optional[jnp.ndarray]]:
+    primitive: Primitive,
+    outval: Tensor,
+    *args: Union[bound_propagation.Bound, Tensor],
+    **kwargs) -> Sequence[Optional[Tensor]]:
   """Back-propagates sensitivity through a linear Jax operation.
 
   For linear ops, sensitivity of the inputs is computed by applying the
@@ -71,9 +68,9 @@ def _sensitivity_linear_op(
 
 
 def _sensitivity_relu(
-    outval: jnp.ndarray,
+    outval: Tensor,
     inp: bound_propagation.Bound
-) -> jnp.ndarray:
+) -> Tensor:
   """Back-propagates sensitivity through a ReLU.
 
   For the purposes of back-propagating sensitivity,
@@ -94,43 +91,47 @@ def _sensitivity_relu(
 
   chord_slope = upper_bound / jnp.maximum(
       upper_bound - lower_bound, jnp.finfo(jnp.float32).eps)
-  return chord_slope * outval,
+  return chord_slope * outval,  # pytype: disable=bad-return-type  # jax-ndarray
 
 
-_LINEAR_PRIMITIVES = (
-    bound_propagation.AFFINE_PRIMITIVES +
-    bound_propagation.RESHAPE_PRIMITIVES +
-    [lax.div_p]
-)
+_LINEAR_PRIMITIVES: Sequence[Primitive] = [
+    *bound_propagation.AFFINE_PRIMITIVES,
+    *bound_propagation.RESHAPE_PRIMITIVES,
+    lax.div_p,
+]
 
 
-def _build_sensitivity_ops() -> Dict[synthetic_primitives.PrimitiveLike,
-                                     Callable[..., jnp.ndarray]]:
+def _build_sensitivity_ops() -> Mapping[
+    Primitive, graph_traversal.PrimitiveBacktransformFn]:
   """Builds functions to back-prop 'sensitivity' through individual primitives.
 
   Returns:
     Sensitivity computation functions, in the form suitable to be passed to
-    `bound_propagation.PropagationGraph.backward_propagation()`.
+    `PropagationGraph.backward_propagation()`.
   """
   sensitivity_primitive_ops = {
       primitive: functools.partial(_sensitivity_linear_op, primitive)
       for primitive in _LINEAR_PRIMITIVES}
   sensitivity_primitive_ops[synthetic_primitives.relu_p] = _sensitivity_relu
+  # Through the sign function, we don't really have a sensitivity.
+  sensitivity_sign = lambda outval, _: (jnp.zeros_like(outval),)
+  sensitivity_primitive_ops[jax.lax.sign_p] = sensitivity_sign
+
   return sensitivity_primitive_ops
 
 
-sensitivity_backward_transform = bound_propagation.BackwardOpwiseTransform(
+sensitivity_backward_transform = graph_traversal.BackwardOpwiseTransform(
     _build_sensitivity_ops(), sum)
 
 
-class SensitivityAlgorithm(
-    bound_propagation.PropagationAlgorithm[Tensor]):
+class SensitivityAlgorithm(bound_propagation.PropagationAlgorithm[Tensor]):
   """Propagation algorithm computing output sensitivity to intermediate nodes."""
 
-  def __init__(self,
-               forward_bound_transform: bound_propagation.GraphTransform[Bound],
-               sensitivity_targets: Sequence[Index],
-               output_sensitivity: Optional[Tensor] = None):
+  def __init__(
+      self,
+      forward_bound_transform: bound_propagation.BoundTransform,
+      sensitivity_targets: Sequence[Index],
+      output_sensitivity: Optional[Tensor] = None):
     """Define the sensitivity that needs to be computed.
 
     Args:
@@ -147,8 +148,8 @@ class SensitivityAlgorithm(
     self._sensitivity_targets = sensitivity_targets
     self.target_sensitivities = []
 
-  def propagate(self, graph: bound_propagation.PropagationGraph,
-                *bounds: Nest[bound_propagation.GraphInput]):
+  def propagate(self, graph: graph_traversal.PropagationGraph,
+                *bounds: Nest[graph_traversal.GraphInput]):
     assert len(graph.outputs) == 1
     out, bound_env = self._forward_bnd_algorithm.propagate(graph, bounds)
 

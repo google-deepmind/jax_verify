@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,13 +38,13 @@ def get_boundprop(name: str, elision: bool
   elif name == 'crown':
     relaxer = linear_relaxations.crown_rvt_relaxer
 
-  transform = forward_linear_bounds.ForwardLinearBoundTransform(
+  transform = forward_linear_bounds.ConcretizingForwardLinearBoundTransform(
       relaxer, elision)
   algorithm = bound_propagation.ForwardPropagationAlgorithm(transform)
   def bound_prop(function, *bounds) -> forward_linear_bounds.LinearBound:
     output_bound, _ = bound_propagation.bound_propagation(
         algorithm, function, *bounds)
-    return output_bound
+    return output_bound  # pytype: disable=bad-return-type  # jax-ndarray
   return bound_prop
 
 

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 from jax_verify.extensions.sdp_verify import utils
+from jax_verify.src import opt_utils
 from jax_verify.tests.sdp_verify import test_utils as sdp_test_utils
 
 
@@ -35,7 +36,7 @@ def sample_bounds(key: jnp.ndarray,
     minval: Optional, smallest value that the bounds could take.
     maxval: Optional, largest value that the bounds could take.
   Returns:
-    lb, ub: Lower and upper bound tensors of the desired shape.
+    lb, ub: Lower and upper bound tensor
   """
   key_0, key_1 = jax.random.split(key)
   bound_1 = jax.random.uniform(key_0, shape, minval=minval, maxval=maxval)
@@ -69,6 +70,29 @@ def sample_bounded_points(key: jnp.ndarray,
 
   bound_range = broad_ub - broad_lb
   return broad_lb + unif_samples * bound_range
+
+
+def sample_bounded_simplex_points(key: jnp.ndarray,
+                                  bounds: Tuple[jnp.ndarray, jnp.ndarray],
+                                  simplex_sum: float,
+                                  nb_points: int) -> jnp.ndarray:
+  """Sample some points respecting the bounds as well as a simplex constraint.
+
+  Args:
+    key: Random number generator
+    bounds: Tuple containing [lower bound, upper bound].
+    simplex_sum: Value that each datapoint should sum to.
+    nb_points: How many points to sample.
+  Returns:
+    Points contained between the given bounds.
+
+  """
+  lb, ub = bounds
+  points = sample_bounded_points(key, bounds, nb_points)
+  project_fun = functools.partial(opt_utils.project_onto_interval_simplex,
+                                  lb, ub, simplex_sum)
+  batch_project_fun = jax.vmap(project_fun)
+  return batch_project_fun(points)
 
 
 def set_up_toy_problem(rng_key, batch_size, architecture):

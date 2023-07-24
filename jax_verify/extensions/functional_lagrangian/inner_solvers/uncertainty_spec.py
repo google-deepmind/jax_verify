@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,9 +67,9 @@ class UncertaintySpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     if self._solve_max == MaxType.EXP:
       return self.solve_max_exp(inner_dual_vars, opt_instance, key, step)
     elif self._solve_max == MaxType.EXP_BOUND:
@@ -87,9 +87,9 @@ class UncertaintySpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     """Solve inner max problem for final layer with uncertainty specification.
 
     Maximize obj'*softmax(x) - lagrangian_form(x) subject to l<=x<=u
@@ -173,9 +173,9 @@ class UncertaintySpecStrategy(dual_build.InnerMaxStrategy):
       self,
       inner_dual_vars: Any,
       opt_instance: InnerVerifInstance,
-      key: jnp.array,
+      key: jnp.ndarray,
       step: int,
-  ) -> jnp.array:
+  ) -> jnp.ndarray:
     """Upper bound (softmax + affine)-type problem with cvxpy.
 
     Upper bound obj'*softmax(x) - lagrangian_form(x) subject to l<=x<=u
@@ -387,7 +387,7 @@ def upper_bound_softmax_plus_affine_exact(
   # combinations below
   for state_coordinates in itertools.product(['interior', 'lower', 'upper'],
                                              repeat=num_coordinates):
-    in_interior = np.ones([num_coordinates], dtype=np.bool)
+    in_interior = np.ones([num_coordinates], dtype=bool)
 
     const_normalization = epsilon  # zero init + small constant for stability
     const_numerator = 1.0

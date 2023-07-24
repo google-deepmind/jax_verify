@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 DeepMind Technologies Limited.
+# Copyright 2023 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Routines to solve the subproblem during verification."""
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 from absl import logging
 import cvxpy as cp
@@ -30,7 +30,7 @@ Tensor = np.ndarray
 
 Variable = Union[relaxation.RelaxVariable,
                  relaxation.BinaryVariable]
-Solution = Dict[str, jnp.ndarray]
+Solution = Mapping[str, jnp.ndarray]
 
 
 class CvxpySolver(relaxation.RelaxationSolver):
@@ -150,7 +150,7 @@ class CvxpySolver(relaxation.RelaxationSolver):
                                           cp.settings.OPTIMAL_INACCURATE)
 
 
-class CvxpyMIPSolver(CvxpySolver, relaxation.MIPSolver):
+class CvxpyMIPSolver(CvxpySolver, relaxation.MIPSolver):  # pytype: disable=signature-mismatch  # maybe_create_solver_variable uses parameter contravariance
   """Holder class to represent problem being built."""
 
   def __init__(self):
@@ -206,4 +206,3 @@ class CvxpyMIPSolver(CvxpySolver, relaxation.MIPSolver):
       self.constraints += [expression <= 0]
     if constraint.sense == -1:
       self.constraints += [expression >= 0]
-
